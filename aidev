@@ -1,0 +1,419 @@
+#!/usr/bin/env bash
+#
+# aidev - AI-powered parallel development with git worktrees and tmux
+#
+# Usage: aidev <command> [options]
+#
+# Commands:
+#   new <feature>     Create a new worktree, tmux window, and launch AI tool
+#   list              List all active feature sessions
+#   attach <feature>  Attach to an existing feature session
+#   cleanup <feature> Remove worktree and close tmux window
+#   cleanup-all       Remove all worktrees and close all feature windows
+#
+
+set -euo pipefail
+
+# Configuration (can be overridden via environment variables)
+AIDEV_TOOL="${AIDEV_TOOL:-opencode}"           # AI tool to launch (opencode, amp, claude, etc.)
+AIDEV_BASE_BRANCH="${AIDEV_BASE_BRANCH:-main}" # Base branch for new worktrees
+AIDEV_WORKTREE_DIR="${AIDEV_WORKTREE_DIR:-}"   # Custom worktree directory (default: ../<repo>-worktrees)
+AIDEV_SESSION_PREFIX="${AIDEV_SESSION_PREFIX:-aidev}" # Prefix for tmux window names
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Print colored output
+info() { echo -e "${BLUE}[info]${NC} $*"; }
+success() { echo -e "${GREEN}[ok]${NC} $*"; }
+warn() { echo -e "${YELLOW}[warn]${NC} $*"; }
+error() { echo -e "${RED}[error]${NC} $*" >&2; }
+
+# Get the git root directory
+get_git_root() {
+    git rev-parse --show-toplevel 2>/dev/null || {
+        error "Not in a git repository"
+        exit 1
+    }
+}
+
+# Get repository name from git root
+get_repo_name() {
+    basename "$(get_git_root)"
+}
+
+# Get the worktree base directory
+get_worktree_base() {
+    if [[ -n "$AIDEV_WORKTREE_DIR" ]]; then
+        echo "$AIDEV_WORKTREE_DIR"
+    else
+        local git_root
+        git_root="$(get_git_root)"
+        echo "$(dirname "$git_root")/$(get_repo_name)-worktrees"
+    fi
+}
+
+# Get worktree path for a feature
+get_worktree_path() {
+    local feature="$1"
+    echo "$(get_worktree_base)/$feature"
+}
+
+# Get tmux window name for a feature
+get_window_name() {
+    local feature="$1"
+    echo "${AIDEV_SESSION_PREFIX}-${feature}"
+}
+
+# Check if tmux is running and we're in a session
+ensure_tmux() {
+    if [[ -z "${TMUX:-}" ]]; then
+        error "Not running inside tmux. Please start tmux first."
+        exit 1
+    fi
+}
+
+# Check if a worktree exists for a feature
+worktree_exists() {
+    local feature="$1"
+    local worktree_path
+    worktree_path="$(get_worktree_path "$feature")"
+    [[ -d "$worktree_path" ]]
+}
+
+# Check if a tmux window exists for a feature
+window_exists() {
+    local feature="$1"
+    local window_name
+    window_name="$(get_window_name "$feature")"
+    tmux list-windows -F '#{window_name}' 2>/dev/null | grep -q "^${window_name}$"
+}
+
+# Create a new feature worktree and tmux window
+cmd_new() {
+    local feature="${1:-}"
+    local base_branch="${2:-$AIDEV_BASE_BRANCH}"
+    
+    if [[ -z "$feature" ]]; then
+        error "Usage: aidev new <feature-name> [base-branch]"
+        exit 1
+    fi
+    
+    ensure_tmux
+    
+    local git_root worktree_path window_name branch_name
+    git_root="$(get_git_root)"
+    worktree_path="$(get_worktree_path "$feature")"
+    window_name="$(get_window_name "$feature")"
+    branch_name="$feature"
+    
+    # Check if worktree already exists
+    if worktree_exists "$feature"; then
+        warn "Worktree already exists at $worktree_path"
+        if window_exists "$feature"; then
+            info "Attaching to existing window..."
+            tmux select-window -t "$window_name"
+            exit 0
+        fi
+    else
+        # Create worktree directory parent if needed
+        mkdir -p "$(dirname "$worktree_path")"
+        
+        # Fetch latest from origin
+        info "Fetching latest from origin..."
+        git -C "$git_root" fetch origin "$base_branch" 2>/dev/null || true
+        
+        # Create new worktree with a new branch
+        info "Creating worktree for '$feature' based on '$base_branch'..."
+        if git -C "$git_root" show-ref --verify --quiet "refs/heads/$branch_name"; then
+            # Branch exists, use it
+            git -C "$git_root" worktree add "$worktree_path" "$branch_name"
+        else
+            # Create new branch from base
+            git -C "$git_root" worktree add -b "$branch_name" "$worktree_path" "origin/$base_branch" 2>/dev/null || \
+            git -C "$git_root" worktree add -b "$branch_name" "$worktree_path" "$base_branch"
+        fi
+        
+        success "Created worktree at $worktree_path"
+    fi
+    
+    # Create tmux window if it doesn't exist
+    if window_exists "$feature"; then
+        info "Window '$window_name' already exists, selecting it..."
+        tmux select-window -t "$window_name"
+    else
+        info "Creating tmux window '$window_name'..."
+        tmux new-window -n "$window_name" -c "$worktree_path"
+        
+        # Launch the AI tool
+        info "Launching $AIDEV_TOOL..."
+        tmux send-keys -t "$window_name" "$AIDEV_TOOL" Enter
+        
+        success "Feature '$feature' is ready!"
+    fi
+    
+    echo ""
+    info "Worktree: $worktree_path"
+    info "Branch:   $branch_name"
+    info "Window:   $window_name"
+    info "AI Tool:  $AIDEV_TOOL"
+}
+
+# List all active feature sessions
+cmd_list() {
+    local git_root worktree_base
+    git_root="$(get_git_root)"
+    worktree_base="$(get_worktree_base)"
+    
+    echo ""
+    echo "Active AI Development Sessions"
+    echo "=============================="
+    echo ""
+    
+    # Get all worktrees for this repo
+    local found=false
+    while IFS= read -r line; do
+        local wt_path wt_branch
+        wt_path="$(echo "$line" | awk '{print $1}')"
+        wt_branch="$(echo "$line" | awk '{print $3}' | tr -d '[]')"
+        
+        # Skip the main worktree
+        if [[ "$wt_path" == "$git_root" ]]; then
+            continue
+        fi
+        
+        # Only show worktrees in our managed directory
+        if [[ "$wt_path" == "$worktree_base"/* ]]; then
+            found=true
+            local feature window_name window_status
+            feature="$(basename "$wt_path")"
+            window_name="$(get_window_name "$feature")"
+            
+            if window_exists "$feature"; then
+                window_status="${GREEN}active${NC}"
+            else
+                window_status="${YELLOW}no window${NC}"
+            fi
+            
+            echo -e "  ${BLUE}$feature${NC}"
+            echo -e "    Branch:  $wt_branch"
+            echo -e "    Path:    $wt_path"
+            echo -e "    Window:  $window_status"
+            echo ""
+        fi
+    done < <(git -C "$git_root" worktree list)
+    
+    if [[ "$found" == false ]]; then
+        echo "  No active feature sessions."
+        echo ""
+        echo "  Start a new one with: aidev new <feature-name>"
+    fi
+    echo ""
+}
+
+# Attach to an existing feature session
+cmd_attach() {
+    local feature="${1:-}"
+    
+    if [[ -z "$feature" ]]; then
+        error "Usage: aidev attach <feature-name>"
+        exit 1
+    fi
+    
+    ensure_tmux
+    
+    local window_name worktree_path
+    window_name="$(get_window_name "$feature")"
+    worktree_path="$(get_worktree_path "$feature")"
+    
+    if ! worktree_exists "$feature"; then
+        error "No worktree found for feature '$feature'"
+        info "Use 'aidev list' to see available features"
+        exit 1
+    fi
+    
+    if window_exists "$feature"; then
+        info "Switching to window '$window_name'..."
+        tmux select-window -t "$window_name"
+    else
+        info "Window doesn't exist, creating it..."
+        tmux new-window -n "$window_name" -c "$worktree_path"
+        
+        info "Launching $AIDEV_TOOL..."
+        tmux send-keys -t "$window_name" "$AIDEV_TOOL" Enter
+    fi
+    
+    success "Attached to '$feature'"
+}
+
+# Cleanup a feature (remove worktree and close window)
+cmd_cleanup() {
+    local feature="${1:-}"
+    local force="${2:-}"
+    
+    if [[ -z "$feature" ]]; then
+        error "Usage: aidev cleanup <feature-name> [--force]"
+        exit 1
+    fi
+    
+    local git_root worktree_path window_name
+    git_root="$(get_git_root)"
+    worktree_path="$(get_worktree_path "$feature")"
+    window_name="$(get_window_name "$feature")"
+    
+    # Close tmux window if it exists
+    if window_exists "$feature"; then
+        info "Closing tmux window '$window_name'..."
+        tmux kill-window -t "$window_name" 2>/dev/null || true
+        success "Closed window"
+    fi
+    
+    # Remove worktree if it exists
+    if worktree_exists "$feature"; then
+        info "Removing worktree at $worktree_path..."
+        if [[ "$force" == "--force" ]] || [[ "$force" == "-f" ]]; then
+            git -C "$git_root" worktree remove --force "$worktree_path"
+        else
+            git -C "$git_root" worktree remove "$worktree_path" || {
+                error "Worktree has uncommitted changes. Use 'aidev cleanup $feature --force' to force removal."
+                exit 1
+            }
+        fi
+        success "Removed worktree"
+    else
+        warn "No worktree found for '$feature'"
+    fi
+    
+    success "Cleaned up '$feature'"
+}
+
+# Cleanup all features
+cmd_cleanup_all() {
+    local force="${1:-}"
+    local git_root worktree_base
+    git_root="$(get_git_root)"
+    worktree_base="$(get_worktree_base)"
+    
+    warn "This will remove ALL aidev worktrees and windows!"
+    read -p "Are you sure? [y/N] " -n 1 -r
+    echo
+    
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        info "Aborted."
+        exit 0
+    fi
+    
+    # Find all worktrees in our managed directory
+    while IFS= read -r line; do
+        local wt_path
+        wt_path="$(echo "$line" | awk '{print $1}')"
+        
+        # Skip the main worktree
+        if [[ "$wt_path" == "$git_root" ]]; then
+            continue
+        fi
+        
+        # Only clean worktrees in our managed directory
+        if [[ "$wt_path" == "$worktree_base"/* ]]; then
+            local feature
+            feature="$(basename "$wt_path")"
+            info "Cleaning up '$feature'..."
+            cmd_cleanup "$feature" "$force"
+        fi
+    done < <(git -C "$git_root" worktree list)
+    
+    success "All features cleaned up!"
+}
+
+# Show help
+cmd_help() {
+    cat << 'EOF'
+aidev - AI-powered parallel development with git worktrees and tmux
+
+USAGE:
+    aidev <command> [options]
+
+COMMANDS:
+    new <feature> [base-branch]   Create new worktree, tmux window, and launch AI tool
+    list                          List all active feature sessions
+    attach <feature>              Attach to an existing feature session
+    cleanup <feature> [--force]   Remove worktree and close tmux window
+    cleanup-all [--force]         Remove all worktrees and close all windows
+    help                          Show this help message
+
+ENVIRONMENT VARIABLES:
+    AIDEV_TOOL          AI tool to launch (default: opencode)
+    AIDEV_BASE_BRANCH   Base branch for new worktrees (default: main)
+    AIDEV_WORKTREE_DIR  Custom worktree directory
+    AIDEV_SESSION_PREFIX Prefix for tmux window names (default: aidev)
+
+EXAMPLES:
+    # Start working on a new feature
+    aidev new add-user-auth
+
+    # Start a feature based on a different branch
+    aidev new hotfix-login release/v2
+
+    # List all active features
+    aidev list
+
+    # Switch to an existing feature
+    aidev attach add-user-auth
+
+    # Clean up when done (merges are handled separately via git/GitHub)
+    aidev cleanup add-user-auth
+
+    # Use a different AI tool
+    AIDEV_TOOL=amp aidev new my-feature
+
+WORKFLOW:
+    1. Start tmux
+    2. Navigate to your git repository
+    3. Run 'aidev new <feature>' to start working on a feature
+    4. The tool creates a worktree, opens a new tmux window, and launches your AI tool
+    5. Work on multiple features by running 'aidev new' for each
+    6. Use 'aidev list' to see all active features
+    7. Use 'aidev attach <feature>' to switch between features
+    8. When done, merge via git/GitHub and run 'aidev cleanup <feature>'
+
+EOF
+}
+
+# Main entry point
+main() {
+    local cmd="${1:-help}"
+    shift || true
+    
+    case "$cmd" in
+        new)
+            cmd_new "$@"
+            ;;
+        list|ls)
+            cmd_list "$@"
+            ;;
+        attach|a)
+            cmd_attach "$@"
+            ;;
+        cleanup|clean|rm)
+            cmd_cleanup "$@"
+            ;;
+        cleanup-all|clean-all|rm-all)
+            cmd_cleanup_all "$@"
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        *)
+            error "Unknown command: $cmd"
+            echo ""
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
