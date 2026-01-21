@@ -19,6 +19,7 @@ AIDEV_TOOL="${AIDEV_TOOL:-opencode}"           # AI tool to launch (opencode, am
 AIDEV_BASE_BRANCH="${AIDEV_BASE_BRANCH:-main}" # Base branch for new worktrees
 AIDEV_WORKTREE_DIR="${AIDEV_WORKTREE_DIR:-}"   # Custom worktree directory (default: ../<repo>-worktrees)
 AIDEV_SESSION_PREFIX="${AIDEV_SESSION_PREFIX:-aidev}" # Prefix for tmux window names
+AIDEV_SESSION_NAME="${AIDEV_SESSION_NAME:-aidev}"     # Tmux session name
 
 # Colors for output
 RED='\033[0;31m'
@@ -69,12 +70,39 @@ get_window_name() {
     echo "${AIDEV_SESSION_PREFIX}-${feature}"
 }
 
-# Check if tmux is running and we're in a session
+# Check if tmux session exists
+session_exists() {
+    tmux has-session -t "$AIDEV_SESSION_NAME" 2>/dev/null
+}
+
+# Ensure we're running inside tmux, start/attach if not
 ensure_tmux() {
-    if [[ -z "${TMUX:-}" ]]; then
-        error "Not running inside tmux. Please start tmux first."
-        exit 1
+    # Already inside tmux, nothing to do
+    if [[ -n "${TMUX:-}" ]]; then
+        return 0
     fi
+    
+    # Not inside tmux - need to start or attach to session and re-exec
+    info "Not running inside tmux, starting session '$AIDEV_SESSION_NAME'..."
+    
+    # Get the full command to re-execute
+    local script_path
+    script_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    local full_cmd="$script_path $AIDEV_ORIGINAL_ARGS"
+    
+    if session_exists; then
+        # Session exists, create a new window and run the command there
+        info "Attaching to existing session..."
+        tmux new-window -t "$AIDEV_SESSION_NAME" -c "$(pwd)" "$full_cmd"
+        tmux attach-session -t "$AIDEV_SESSION_NAME"
+    else
+        # Create new session and run the command
+        info "Creating new tmux session..."
+        tmux new-session -s "$AIDEV_SESSION_NAME" -c "$(pwd)" "$full_cmd"
+    fi
+    
+    # If we get here, tmux has exited, so we should too
+    exit 0
 }
 
 # Check if a worktree exists for a feature
@@ -90,7 +118,7 @@ window_exists() {
     local feature="$1"
     local window_name
     window_name="$(get_window_name "$feature")"
-    tmux list-windows -F '#{window_name}' 2>/dev/null | grep -q "^${window_name}$"
+    tmux list-windows -t "$AIDEV_SESSION_NAME" -F '#{window_name}' 2>/dev/null | grep -q "^${window_name}$"
 }
 
 # Run pre-hook script if it exists
@@ -393,7 +421,7 @@ USAGE:
     aidev <command> [options]
 
 COMMANDS:
-    new <feature> [base-branch]   Create new worktree, tmux window, and launch AI tool
+    new|add <feature> [base-branch]   Create new worktree, tmux window, and launch AI tool
     list                          List all active feature sessions
     attach <feature>              Attach to an existing feature session
     cleanup <feature> [--force]   Remove worktree and close tmux window
@@ -401,9 +429,10 @@ COMMANDS:
     help                          Show this help message
 
 ENVIRONMENT VARIABLES:
-    AIDEV_TOOL          AI tool to launch (default: opencode)
-    AIDEV_BASE_BRANCH   Base branch for new worktrees (default: main)
-    AIDEV_WORKTREE_DIR  Custom worktree directory
+    AIDEV_TOOL           AI tool to launch (default: opencode)
+    AIDEV_BASE_BRANCH    Base branch for new worktrees (default: main)
+    AIDEV_WORKTREE_DIR   Custom worktree directory
+    AIDEV_SESSION_NAME   Tmux session name (default: aidev)
     AIDEV_SESSION_PREFIX Prefix for tmux window names (default: aidev)
 
 EXAMPLES:
@@ -444,25 +473,28 @@ HOOKS:
                     npm install
 
 WORKFLOW:
-    1. Start tmux
-    2. Navigate to your git repository
-    3. Run 'aidev new <feature>' to start working on a feature
-    4. The tool creates a worktree, runs .aidev-pre (if present), opens a tmux window, and launches your AI tool
-    5. Work on multiple features by running 'aidev new' for each
-    6. Use 'aidev list' to see all active features
-    7. Use 'aidev attach <feature>' to switch between features
-    8. When done, merge via git/GitHub and run 'aidev cleanup <feature>'
+    1. Navigate to your git repository
+    2. Run 'aidev new <feature>' to start working on a feature
+       (tmux session is started automatically if not already running)
+    3. The tool creates a worktree, runs .aidev-pre (if present), opens a tmux window, and launches your AI tool
+    4. Work on multiple features by running 'aidev new' for each
+    5. Use 'aidev list' to see all active features
+    6. Use 'aidev attach <feature>' to switch between features
+    7. When done, merge via git/GitHub and run 'aidev cleanup <feature>'
 
 EOF
 }
 
 # Main entry point
 main() {
+    # Save original args for re-exec inside tmux (must be done before shifting)
+    AIDEV_ORIGINAL_ARGS="${*}"
+    
     local cmd="${1:-help}"
     shift || true
     
     case "$cmd" in
-        new)
+        new|add)
             cmd_new "$@"
             ;;
         list|ls)
