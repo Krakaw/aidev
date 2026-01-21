@@ -93,6 +93,46 @@ window_exists() {
     tmux list-windows -F '#{window_name}' 2>/dev/null | grep -q "^${window_name}$"
 }
 
+# Run pre-hook script if it exists
+# Called after worktree creation, before tmux window creation
+# Arguments: worktree_path, feature_name, git_root
+# Also exports: AIDEV_WORKTREE_PATH, AIDEV_FEATURE_NAME, AIDEV_GIT_ROOT
+run_pre_hook() {
+    local worktree_path="$1"
+    local feature="$2"
+    local git_root="$3"
+    
+    local hook_file="$git_root/.aidev-pre"
+    
+    # No hook file, nothing to do
+    if [[ ! -f "$hook_file" ]]; then
+        return 0
+    fi
+    
+    # Check if executable
+    if [[ ! -x "$hook_file" ]]; then
+        warn "Found .aidev-pre but it's not executable. Run: chmod +x .aidev-pre"
+        return 0
+    fi
+    
+    info "Running pre-hook script (.aidev-pre)..."
+    echo ""
+    
+    # Export environment variables and run with positional args
+    if AIDEV_WORKTREE_PATH="$worktree_path" \
+       AIDEV_FEATURE_NAME="$feature" \
+       AIDEV_GIT_ROOT="$git_root" \
+       "$hook_file" "$worktree_path" "$feature" "$git_root"; then
+        echo ""
+        success "Pre-hook completed successfully"
+        return 0
+    else
+        echo ""
+        error "Pre-hook script failed (exit code: $?)"
+        return 1
+    fi
+}
+
 # Create a new feature worktree and tmux window
 cmd_new() {
     local feature="${1:-}"
@@ -139,6 +179,21 @@ cmd_new() {
         fi
         
         success "Created worktree at $worktree_path"
+        
+        # Run pre-hook if it exists
+        if ! run_pre_hook "$worktree_path" "$feature" "$git_root"; then
+            # Hook failed - ask user what to do
+            echo ""
+            read -p "Pre-hook failed. Continue anyway? [y/N] " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                info "Cleaning up worktree..."
+                git -C "$git_root" worktree remove --force "$worktree_path" 2>/dev/null || true
+                error "Aborted."
+                exit 1
+            fi
+            warn "Continuing despite hook failure..."
+        fi
     fi
     
     # Create tmux window if it doesn't exist
@@ -370,11 +425,29 @@ EXAMPLES:
     # Use a different AI tool
     AIDEV_TOOL=amp aidev new my-feature
 
+HOOKS:
+    .aidev-pre    Script run after worktree creation (before AI tool launch)
+                  Place this file in your repository root (can be .gitignored)
+                  
+                  Arguments passed to the script:
+                    $1 = worktree path
+                    $2 = feature/branch name  
+                    $3 = git root (original repo)
+                  
+                  Environment variables also set:
+                    AIDEV_WORKTREE_PATH, AIDEV_FEATURE_NAME, AIDEV_GIT_ROOT
+                  
+                  Example .aidev-pre:
+                    #!/usr/bin/env bash
+                    cd "$1"
+                    cp "$3/.env" .env 2>/dev/null
+                    npm install
+
 WORKFLOW:
     1. Start tmux
     2. Navigate to your git repository
     3. Run 'aidev new <feature>' to start working on a feature
-    4. The tool creates a worktree, opens a new tmux window, and launches your AI tool
+    4. The tool creates a worktree, runs .aidev-pre (if present), opens a tmux window, and launches your AI tool
     5. Work on multiple features by running 'aidev new' for each
     6. Use 'aidev list' to see all active features
     7. Use 'aidev attach <feature>' to switch between features
