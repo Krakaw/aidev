@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
-# aidev - AI-powered parallel development with git worktrees and tmux
+# aidev - AI-powered parallel development with git worktrees and screen/tmux
 #
 # Usage: aidev <command> [options]
 #
 # Commands:
-#   new <feature>     Create a new worktree, tmux window, and launch AI tool
+#   new <feature>     Create a new worktree, window, and launch AI tool
 #   list              List all active feature sessions
 #   attach <feature>  Attach to an existing feature session
-#   cleanup <feature> Remove worktree and close tmux window
+#   cleanup <feature> Remove worktree and close window
 #   cleanup-all       Remove all worktrees and close all feature windows
 #
 
@@ -18,8 +18,9 @@ set -euo pipefail
 AIDEV_TOOL="${AIDEV_TOOL:-opencode}"           # AI tool to launch (opencode, amp, claude, etc.)
 AIDEV_BASE_BRANCH="${AIDEV_BASE_BRANCH:-main}" # Base branch for new worktrees
 AIDEV_WORKTREE_DIR="${AIDEV_WORKTREE_DIR:-}"   # Custom worktree directory (default: ../<repo>-worktrees)
-AIDEV_SESSION_PREFIX="${AIDEV_SESSION_PREFIX:-aidev}" # Prefix for tmux window names
-AIDEV_SESSION_NAME="${AIDEV_SESSION_NAME:-aidev}"     # Tmux session name
+AIDEV_SESSION_PREFIX="${AIDEV_SESSION_PREFIX:-aidev}" # Prefix for window names
+AIDEV_SESSION_NAME="${AIDEV_SESSION_NAME:-aidev}"     # Session name
+AIDEV_MULTIPLEXER="${AIDEV_MULTIPLEXER:-screen}"      # Terminal multiplexer: screen or tmux
 
 # Colors for output
 RED='\033[0;31m'
@@ -64,44 +65,112 @@ get_worktree_path() {
     echo "$(get_worktree_base)/$feature"
 }
 
-# Get tmux window name for a feature
+# Get window name for a feature
 get_window_name() {
     local feature="$1"
     echo "${AIDEV_SESSION_PREFIX}-${feature}"
 }
 
-# Check if tmux session exists
+# Check if multiplexer session exists
 session_exists() {
-    tmux has-session -t "$AIDEV_SESSION_NAME" 2>/dev/null
+    case "$AIDEV_MULTIPLEXER" in
+        screen)
+            screen -list 2>/dev/null | grep -q "\.${AIDEV_SESSION_NAME}[[:space:]]"
+            ;;
+        tmux)
+            tmux has-session -t "$AIDEV_SESSION_NAME" 2>/dev/null
+            ;;
+        *)
+            error "Unknown multiplexer: $AIDEV_MULTIPLEXER (use 'screen' or 'tmux')"
+            exit 1
+            ;;
+    esac
 }
 
-# Ensure we're running inside tmux, start/attach if not
-ensure_tmux() {
-    # Already inside tmux, nothing to do
-    if [[ -n "${TMUX:-}" ]]; then
+# Check if we're inside the multiplexer
+inside_multiplexer() {
+    case "$AIDEV_MULTIPLEXER" in
+        screen)
+            [[ -n "${STY:-}" ]]
+            ;;
+        tmux)
+            [[ -n "${TMUX:-}" ]]
+            ;;
+    esac
+}
+
+# Attach to existing session
+attach_session() {
+    case "$AIDEV_MULTIPLEXER" in
+        screen)
+            screen -r "$AIDEV_SESSION_NAME"
+            ;;
+        tmux)
+            tmux attach-session -t "$AIDEV_SESSION_NAME"
+            ;;
+    esac
+}
+
+# Create new session and run command
+create_session() {
+    local full_cmd="$1"
+    local workdir="$2"
+    case "$AIDEV_MULTIPLEXER" in
+        screen)
+            # screen -c /dev/null avoids loading user's .screenrc which may cause issues
+            screen -S "$AIDEV_SESSION_NAME" -c /dev/null bash -c "cd '$workdir' && $full_cmd; exec bash"
+            ;;
+        tmux)
+            tmux new-session -s "$AIDEV_SESSION_NAME" -c "$workdir" "$full_cmd"
+            ;;
+    esac
+}
+
+# Create new window in session and run command
+create_session_window() {
+    local full_cmd="$1"
+    local workdir="$2"
+    case "$AIDEV_MULTIPLEXER" in
+        screen)
+            # Create window and run command, then attach
+            screen -S "$AIDEV_SESSION_NAME" -X screen bash -c "cd '$workdir' && $full_cmd; exec bash"
+            screen -r "$AIDEV_SESSION_NAME"
+            ;;
+        tmux)
+            tmux new-window -t "$AIDEV_SESSION_NAME" -c "$workdir" "$full_cmd"
+            tmux attach-session -t "$AIDEV_SESSION_NAME"
+            ;;
+    esac
+}
+
+# Ensure we're running inside the multiplexer, start/attach if not
+ensure_multiplexer() {
+    # Already inside multiplexer, nothing to do
+    if inside_multiplexer; then
         return 0
     fi
     
-    # Not inside tmux - need to start or attach to session and re-exec
-    info "Not running inside tmux, starting session '$AIDEV_SESSION_NAME'..."
+    # Not inside multiplexer - need to start or attach to session and re-exec
+    info "Not running inside $AIDEV_MULTIPLEXER, starting session '$AIDEV_SESSION_NAME'..."
     
     # Get the full command to re-execute
     local script_path
     script_path="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
     local full_cmd="$script_path $AIDEV_ORIGINAL_ARGS"
+    local workdir
+    workdir="$(pwd)"
     
     if session_exists; then
         # Session exists, create a new window and run the command there
         info "Attaching to existing session..."
-        tmux new-window -t "$AIDEV_SESSION_NAME" -c "$(pwd)" "$full_cmd"
-        tmux attach-session -t "$AIDEV_SESSION_NAME"
+        create_session_window "$full_cmd" "$workdir"
     else
         # Create new session and run the command
-        info "Creating new tmux session..."
-        tmux new-session -s "$AIDEV_SESSION_NAME" -c "$(pwd)" "$full_cmd"
+        info "Creating new $AIDEV_MULTIPLEXER session..."
+        create_session "$full_cmd" "$workdir"
     fi
     
-    # If we get here, tmux has exited, so we should too
+    # If we get here, multiplexer has exited, so we should too
     exit 0
 }
 
@@ -113,16 +182,77 @@ worktree_exists() {
     [[ -d "$worktree_path" ]]
 }
 
-# Check if a tmux window exists for a feature
+# Check if a window exists for a feature
 window_exists() {
     local feature="$1"
     local window_name
     window_name="$(get_window_name "$feature")"
-    tmux list-windows -t "$AIDEV_SESSION_NAME" -F '#{window_name}' 2>/dev/null | grep -q "^${window_name}$"
+    case "$AIDEV_MULTIPLEXER" in
+        screen)
+            screen -S "$AIDEV_SESSION_NAME" -Q windows 2>/dev/null | grep -q "$window_name"
+            ;;
+        tmux)
+            tmux list-windows -t "$AIDEV_SESSION_NAME" -F '#{window_name}' 2>/dev/null | grep -q "^${window_name}$"
+            ;;
+    esac
+}
+
+# Create a new window and optionally run a command
+new_window() {
+    local window_name="$1"
+    local workdir="$2"
+    case "$AIDEV_MULTIPLEXER" in
+        screen)
+            screen -S "$AIDEV_SESSION_NAME" -X screen -t "$window_name" bash -c "cd '$workdir'; exec bash"
+            ;;
+        tmux)
+            tmux new-window -n "$window_name" -c "$workdir"
+            ;;
+    esac
+}
+
+# Select/focus a window
+select_window() {
+    local window_name="$1"
+    case "$AIDEV_MULTIPLEXER" in
+        screen)
+            screen -S "$AIDEV_SESSION_NAME" -X select "$window_name"
+            ;;
+        tmux)
+            tmux select-window -t "$window_name"
+            ;;
+    esac
+}
+
+# Send keys/command to a window
+send_keys() {
+    local window_name="$1"
+    local keys="$2"
+    case "$AIDEV_MULTIPLEXER" in
+        screen)
+            screen -S "$AIDEV_SESSION_NAME" -p "$window_name" -X stuff "$keys\n"
+            ;;
+        tmux)
+            tmux send-keys -t "$window_name" "$keys" Enter
+            ;;
+    esac
+}
+
+# Kill/close a window
+kill_window() {
+    local window_name="$1"
+    case "$AIDEV_MULTIPLEXER" in
+        screen)
+            screen -S "$AIDEV_SESSION_NAME" -p "$window_name" -X kill 2>/dev/null || true
+            ;;
+        tmux)
+            tmux kill-window -t "$window_name" 2>/dev/null || true
+            ;;
+    esac
 }
 
 # Run pre-hook script if it exists
-# Called after worktree creation, before tmux window creation
+# Called after worktree creation, before window creation
 # Arguments: worktree_path, feature_name, git_root
 # Also exports: AIDEV_WORKTREE_PATH, AIDEV_FEATURE_NAME, AIDEV_GIT_ROOT
 run_pre_hook() {
@@ -161,7 +291,7 @@ run_pre_hook() {
     fi
 }
 
-# Create a new feature worktree and tmux window
+# Create a new feature worktree and window
 cmd_new() {
     local feature="${1:-}"
     local base_branch="${2:-$AIDEV_BASE_BRANCH}"
@@ -171,7 +301,7 @@ cmd_new() {
         exit 1
     fi
     
-    ensure_tmux
+    ensure_multiplexer
     
     local git_root worktree_path window_name branch_name
     git_root="$(get_git_root)"
@@ -184,7 +314,7 @@ cmd_new() {
         warn "Worktree already exists at $worktree_path"
         if window_exists "$feature"; then
             info "Attaching to existing window..."
-            tmux select-window -t "$window_name"
+            select_window "$window_name"
             exit 0
         fi
     else
@@ -224,17 +354,17 @@ cmd_new() {
         fi
     fi
     
-    # Create tmux window if it doesn't exist
+    # Create window if it doesn't exist
     if window_exists "$feature"; then
         info "Window '$window_name' already exists, selecting it..."
-        tmux select-window -t "$window_name"
+        select_window "$window_name"
     else
-        info "Creating tmux window '$window_name'..."
-        tmux new-window -n "$window_name" -c "$worktree_path"
+        info "Creating window '$window_name'..."
+        new_window "$window_name" "$worktree_path"
         
         # Launch the AI tool
         info "Launching $AIDEV_TOOL..."
-        tmux send-keys -t "$window_name" "$AIDEV_TOOL" Enter
+        send_keys "$window_name" "$AIDEV_TOOL"
         
         success "Feature '$feature' is ready!"
     fi
@@ -307,7 +437,7 @@ cmd_attach() {
         exit 1
     fi
     
-    ensure_tmux
+    ensure_multiplexer
     
     local window_name worktree_path
     window_name="$(get_window_name "$feature")"
@@ -321,13 +451,13 @@ cmd_attach() {
     
     if window_exists "$feature"; then
         info "Switching to window '$window_name'..."
-        tmux select-window -t "$window_name"
+        select_window "$window_name"
     else
         info "Window doesn't exist, creating it..."
-        tmux new-window -n "$window_name" -c "$worktree_path"
+        new_window "$window_name" "$worktree_path"
         
         info "Launching $AIDEV_TOOL..."
-        tmux send-keys -t "$window_name" "$AIDEV_TOOL" Enter
+        send_keys "$window_name" "$AIDEV_TOOL"
     fi
     
     success "Attached to '$feature'"
@@ -348,10 +478,10 @@ cmd_cleanup() {
     worktree_path="$(get_worktree_path "$feature")"
     window_name="$(get_window_name "$feature")"
     
-    # Close tmux window if it exists
+    # Close window if it exists
     if window_exists "$feature"; then
-        info "Closing tmux window '$window_name'..."
-        tmux kill-window -t "$window_name" 2>/dev/null || true
+        info "Closing window '$window_name'..."
+        kill_window "$window_name"
         success "Closed window"
     fi
     
@@ -415,16 +545,16 @@ cmd_cleanup_all() {
 # Show help
 cmd_help() {
     cat << 'EOF'
-aidev - AI-powered parallel development with git worktrees and tmux
+aidev - AI-powered parallel development with git worktrees and screen/tmux
 
 USAGE:
     aidev <command> [options]
 
 COMMANDS:
-    new|add <feature> [base-branch]   Create new worktree, tmux window, and launch AI tool
+    new|add <feature> [base-branch]   Create new worktree, window, and launch AI tool
     list                          List all active feature sessions
     attach <feature>              Attach to an existing feature session
-    cleanup <feature> [--force]   Remove worktree and close tmux window
+    cleanup <feature> [--force]   Remove worktree and close window
     cleanup-all [--force]         Remove all worktrees and close all windows
     help                          Show this help message
 
@@ -432,8 +562,9 @@ ENVIRONMENT VARIABLES:
     AIDEV_TOOL           AI tool to launch (default: opencode)
     AIDEV_BASE_BRANCH    Base branch for new worktrees (default: main)
     AIDEV_WORKTREE_DIR   Custom worktree directory
-    AIDEV_SESSION_NAME   Tmux session name (default: aidev)
-    AIDEV_SESSION_PREFIX Prefix for tmux window names (default: aidev)
+    AIDEV_MULTIPLEXER    Terminal multiplexer: screen or tmux (default: screen)
+    AIDEV_SESSION_NAME   Session name (default: aidev)
+    AIDEV_SESSION_PREFIX Prefix for window names (default: aidev)
 
 EXAMPLES:
     # Start working on a new feature
@@ -453,6 +584,9 @@ EXAMPLES:
 
     # Use a different AI tool
     AIDEV_TOOL=amp aidev new my-feature
+
+    # Use tmux instead of screen
+    AIDEV_MULTIPLEXER=tmux aidev new my-feature
 
 HOOKS:
     .aidev-pre    Script run after worktree creation (before AI tool launch)
@@ -475,8 +609,8 @@ HOOKS:
 WORKFLOW:
     1. Navigate to your git repository
     2. Run 'aidev new <feature>' to start working on a feature
-       (tmux session is started automatically if not already running)
-    3. The tool creates a worktree, runs .aidev-pre (if present), opens a tmux window, and launches your AI tool
+       (screen/tmux session is started automatically if not already running)
+    3. The tool creates a worktree, runs .aidev-pre (if present), opens a window, and launches your AI tool
     4. Work on multiple features by running 'aidev new' for each
     5. Use 'aidev list' to see all active features
     6. Use 'aidev attach <feature>' to switch between features
@@ -487,7 +621,7 @@ EOF
 
 # Main entry point
 main() {
-    # Save original args for re-exec inside tmux (must be done before shifting)
+    # Save original args for re-exec inside multiplexer (must be done before shifting)
     AIDEV_ORIGINAL_ARGS="${*}"
     
     local cmd="${1:-help}"
