@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# aidev - AI-powered parallel development with git worktrees and screen/tmux
+# aidev - AI-powered parallel development with git worktrees and tmux
 #
 # Usage: aidev <command> [options]
 #
