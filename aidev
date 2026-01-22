@@ -7,8 +7,9 @@
 # Commands:
 #   new <feature>     Create a new worktree, window, and launch AI tool
 #   list              List all active feature sessions
-#   attach <feature>  Attach to an existing feature session
-#   cleanup <feature> Remove worktree and close window
+#   attach [feature]  Attach to an existing feature session (fzf if not specified)
+#   cd [feature]      Print worktree path for cd (fzf if not specified)
+#   cleanup [feature] Remove worktree and close window (fzf if not specified)
 #   cleanup-all       Remove all worktrees and close all feature windows
 #
 
@@ -35,12 +36,25 @@ success() { echo -e "${GREEN}[ok]${NC} $*"; }
 warn() { echo -e "${YELLOW}[warn]${NC} $*"; }
 error() { echo -e "${RED}[error]${NC} $*" >&2; }
 
-# Get the git root directory
+# Get the git root directory (main repo, not worktree)
+# When inside a worktree, this returns the main repository path
 get_git_root() {
-    git rev-parse --show-toplevel 2>/dev/null || {
+    local toplevel
+    toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" || {
         error "Not in a git repository"
         exit 1
     }
+    
+    # Check if we're in a worktree by looking at the first line of 'git worktree list'
+    # The first entry is always the main worktree (the original repo)
+    local main_worktree
+    main_worktree="$(git worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //')"
+    
+    if [[ -n "$main_worktree" ]]; then
+        echo "$main_worktree"
+    else
+        echo "$toplevel"
+    fi
 }
 
 # Get repository name from git root
@@ -69,6 +83,60 @@ get_worktree_path() {
 get_window_name() {
     local feature="$1"
     echo "${AIDEV_SESSION_PREFIX}-${feature}"
+}
+
+# Get list of managed feature names (one per line)
+get_managed_features() {
+    local git_root worktree_base
+    git_root="$(get_git_root)"
+    worktree_base="$(get_worktree_base)"
+    
+    while IFS= read -r line; do
+        local wt_path
+        wt_path="$(echo "$line" | awk '{print $1}')"
+        
+        # Skip the main worktree
+        if [[ "$wt_path" == "$git_root" ]]; then
+            continue
+        fi
+        
+        # Only show worktrees in our managed directory
+        if [[ "$wt_path" == "$worktree_base"/* ]]; then
+            basename "$wt_path"
+        fi
+    done < <(git -C "$git_root" worktree list 2>/dev/null)
+}
+
+# Select a feature using fzf, or fail if no features exist
+# Usage: select_feature "prompt message"
+# Returns: selected feature name on stdout, exits 1 if cancelled or no features
+select_feature() {
+    local prompt="${1:-Select a feature}"
+    
+    # Check if fzf is available
+    if ! command -v fzf &>/dev/null; then
+        error "fzf is required for interactive selection. Install it or provide a feature name."
+        exit 1
+    fi
+    
+    # Get list of features
+    local features
+    features="$(get_managed_features)"
+    
+    if [[ -z "$features" ]]; then
+        error "No managed worktrees found."
+        info "Use 'aidev new <feature-name>' to create one."
+        exit 1
+    fi
+    
+    # Let user select with fzf
+    local selected
+    selected="$(echo "$features" | fzf --prompt="$prompt: " --height=~50% --reverse)" || {
+        error "No feature selected."
+        exit 1
+    }
+    
+    echo "$selected"
 }
 
 # Check if multiplexer session exists
@@ -432,9 +500,9 @@ cmd_list() {
 cmd_attach() {
     local feature="${1:-}"
     
+    # If no feature provided, use fzf to select one
     if [[ -z "$feature" ]]; then
-        error "Usage: aidev attach <feature-name>"
-        exit 1
+        feature="$(select_feature "Attach to feature")"
     fi
     
     ensure_multiplexer
@@ -468,9 +536,15 @@ cmd_cleanup() {
     local feature="${1:-}"
     local force="${2:-}"
     
+    # Handle --force as first argument
+    if [[ "$feature" == "--force" ]] || [[ "$feature" == "-f" ]]; then
+        force="$feature"
+        feature=""
+    fi
+    
+    # If no feature provided, use fzf to select one
     if [[ -z "$feature" ]]; then
-        error "Usage: aidev cleanup <feature-name> [--force]"
-        exit 1
+        feature="$(select_feature "Cleanup feature")"
     fi
     
     local git_root worktree_path window_name
@@ -542,6 +616,31 @@ cmd_cleanup_all() {
     success "All features cleaned up!"
 }
 
+# Print worktree path for cd (to be used with shell integration)
+# Since a subprocess cannot change the parent shell's directory,
+# this outputs the path to be used with: cd "$(aidev cd)"
+# Or add a shell function: aidev() { if [[ "$1" == "cd" ]]; then shift; cd "$(command aidev cd "$@")"; else command aidev "$@"; fi; }
+cmd_cd() {
+    local feature="${1:-}"
+    
+    # If no feature provided, use fzf to select one
+    if [[ -z "$feature" ]]; then
+        feature="$(select_feature "cd to feature")" 2>/dev/null
+    fi
+    
+    local worktree_path
+    worktree_path="$(get_worktree_path "$feature")"
+    
+    if ! worktree_exists "$feature"; then
+        error "No worktree found for feature '$feature'"
+        info "Use 'aidev list' to see available features"
+        exit 1
+    fi
+    
+    # Output the path - shell integration will handle the actual cd
+    echo "$worktree_path"
+}
+
 # Show help
 cmd_help() {
     cat << 'EOF'
@@ -552,11 +651,15 @@ USAGE:
 
 COMMANDS:
     new|add <feature> [base-branch]   Create new worktree, window, and launch AI tool
-    list                          List all active feature sessions
-    attach <feature>              Attach to an existing feature session
-    cleanup <feature> [--force]   Remove worktree and close window
-    cleanup-all [--force]         Remove all worktrees and close all windows
-    help                          Show this help message
+    list                              List all active feature sessions
+    attach [feature]                  Attach to an existing feature session
+    cd [feature]                      Print worktree path (for use with cd)
+    cleanup [feature] [--force]       Remove worktree and close window
+    cleanup-all [--force]             Remove all worktrees and close all windows
+    help                              Show this help message
+
+    For 'attach', 'cd', and 'cleanup', if no feature is specified, an interactive
+    selector (fzf) will be shown to choose from existing worktrees.
 
 ENVIRONMENT VARIABLES:
     AIDEV_TOOL           AI tool to launch (default: opencode)
@@ -576,10 +679,22 @@ EXAMPLES:
     # List all active features
     aidev list
 
-    # Switch to an existing feature
+    # Switch to an existing feature (with fzf selection)
+    aidev attach
+
+    # Switch to a specific feature
     aidev attach add-user-auth
 
-    # Clean up when done (merges are handled separately via git/GitHub)
+    # Change directory to a worktree (with fzf selection)
+    cd "$(aidev cd)"
+
+    # Change directory to a specific worktree
+    cd "$(aidev cd add-user-auth)"
+
+    # Clean up a feature (with fzf selection)
+    aidev cleanup
+
+    # Clean up a specific feature
     aidev cleanup add-user-auth
 
     # Use a different AI tool
@@ -587,6 +702,26 @@ EXAMPLES:
 
     # Use tmux instead of screen
     AIDEV_MULTIPLEXER=tmux aidev new my-feature
+
+SHELL INTEGRATION:
+    To make 'aidev cd' change your shell's directory, add this to .bashrc/.zshrc:
+
+        aidev() {
+            if [[ "$1" == "cd" ]]; then
+                shift
+                local dir
+                dir="$(command aidev cd "$@")" && cd "$dir"
+            else
+                command aidev "$@"
+            fi
+        }
+
+    Then use: aidev cd [feature]
+
+NOTES:
+    This tool works from both the main repository and from within any
+    worktree managed by aidev. Git operations always reference the main
+    repository regardless of your current working directory.
 
 HOOKS:
     .aidev-pre    Script run after worktree creation (before AI tool launch)
@@ -607,14 +742,14 @@ HOOKS:
                     npm install
 
 WORKFLOW:
-    1. Navigate to your git repository
+    1. Navigate to your git repository (or any worktree managed by aidev)
     2. Run 'aidev new <feature>' to start working on a feature
        (screen/tmux session is started automatically if not already running)
     3. The tool creates a worktree, runs .aidev-pre (if present), opens a window, and launches your AI tool
     4. Work on multiple features by running 'aidev new' for each
     5. Use 'aidev list' to see all active features
-    6. Use 'aidev attach <feature>' to switch between features
-    7. When done, merge via git/GitHub and run 'aidev cleanup <feature>'
+    6. Use 'aidev attach' to switch between features (fzf selection or specify name)
+    7. When done, merge via git/GitHub and run 'aidev cleanup'
 
 EOF
 }
@@ -636,6 +771,9 @@ main() {
             ;;
         attach|a)
             cmd_attach "$@"
+            ;;
+        cd)
+            cmd_cd "$@"
             ;;
         cleanup|clean|rm)
             cmd_cleanup "$@"
