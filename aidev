@@ -20,8 +20,7 @@ AIDEV_TOOL="${AIDEV_TOOL:-opencode}"           # AI tool to launch (opencode, am
 AIDEV_BASE_BRANCH="${AIDEV_BASE_BRANCH:-main}" # Base branch for new worktrees
 AIDEV_WORKTREE_DIR="${AIDEV_WORKTREE_DIR:-}"   # Custom worktree directory (default: ../<repo>-worktrees)
 AIDEV_SESSION_PREFIX="${AIDEV_SESSION_PREFIX:-aidev}" # Prefix for window names
-AIDEV_SESSION_NAME="${AIDEV_SESSION_NAME:-aidev}"     # Session name
-AIDEV_MULTIPLEXER="${AIDEV_MULTIPLEXER:-screen}"      # Terminal multiplexer: screen or tmux
+AIDEV_SESSION_NAME="${AIDEV_SESSION_NAME:-aidev}"     # tmux session name
 
 # Colors for output
 RED='\033[0;31m'
@@ -73,10 +72,29 @@ get_worktree_base() {
     fi
 }
 
-# Get worktree path for a feature
-get_worktree_path() {
+# Construct worktree path for a new feature (does not check if it exists)
+make_worktree_path() {
     local feature="$1"
     echo "$(get_worktree_base)/$feature"
+}
+
+# Get worktree path for a branch name (authoritative lookup from git)
+# Only returns paths within the managed worktree directory
+# Returns empty string if not found
+get_worktree_path_for_branch() {
+    local branch="$1"
+    local git_root worktree_base
+    git_root="$(get_git_root)"
+    worktree_base="$(get_worktree_base)"
+    
+    git -C "$git_root" worktree list --porcelain 2>/dev/null \
+    | awk -v want="$branch" -v wt_base="$worktree_base" '
+        $1=="worktree" { wt=$2 }
+        $1=="branch" {
+          b=$2; sub("^refs/heads/","",b)
+          if (b==want && index(wt, wt_base"/") == 1) { print wt; exit }
+        }
+      '
 }
 
 # Get window name for a feature
@@ -85,26 +103,22 @@ get_window_name() {
     echo "${AIDEV_SESSION_PREFIX}-${feature}"
 }
 
-# Get list of managed feature names (one per line)
+# Get list of managed branch/feature names (one per line)
 get_managed_features() {
     local git_root worktree_base
     git_root="$(get_git_root)"
     worktree_base="$(get_worktree_base)"
     
-    while IFS= read -r line; do
-        local wt_path
-        wt_path="$(echo "$line" | awk '{print $1}')"
-        
-        # Skip the main worktree
-        if [[ "$wt_path" == "$git_root" ]]; then
-            continue
-        fi
-        
-        # Only show worktrees in our managed directory
-        if [[ "$wt_path" == "$worktree_base"/* ]]; then
-            basename "$wt_path"
-        fi
-    done < <(git -C "$git_root" worktree list 2>/dev/null)
+    git -C "$git_root" worktree list --porcelain 2>/dev/null \
+    | awk -v git_root="$git_root" -v wt_base="$worktree_base" '
+        $1=="worktree" { wt=$2 }
+        $1=="branch" {
+          b=$2; sub("^refs/heads/","",b)
+          if (wt != git_root && index(wt, wt_base"/") == 1) {
+            print b
+          }
+        }
+      '
 }
 
 # Select a feature using fzf, or fail if no features exist
@@ -139,87 +153,45 @@ select_feature() {
     echo "$selected"
 }
 
-# Check if multiplexer session exists
+# Check if tmux session exists
 session_exists() {
-    case "$AIDEV_MULTIPLEXER" in
-        screen)
-            screen -list 2>/dev/null | grep -q "\.${AIDEV_SESSION_NAME}[[:space:]]"
-            ;;
-        tmux)
-            tmux has-session -t "$AIDEV_SESSION_NAME" 2>/dev/null
-            ;;
-        *)
-            error "Unknown multiplexer: $AIDEV_MULTIPLEXER (use 'screen' or 'tmux')"
-            exit 1
-            ;;
-    esac
+    tmux has-session -t "$AIDEV_SESSION_NAME" 2>/dev/null
 }
 
-# Check if we're inside the multiplexer
+# Check if we're inside tmux
 inside_multiplexer() {
-    case "$AIDEV_MULTIPLEXER" in
-        screen)
-            [[ -n "${STY:-}" ]]
-            ;;
-        tmux)
-            [[ -n "${TMUX:-}" ]]
-            ;;
-    esac
+    [[ -n "${TMUX:-}" ]]
 }
 
-# Attach to existing session
+# Attach to existing tmux session
 attach_session() {
-    case "$AIDEV_MULTIPLEXER" in
-        screen)
-            screen -r "$AIDEV_SESSION_NAME"
-            ;;
-        tmux)
-            tmux attach-session -t "$AIDEV_SESSION_NAME"
-            ;;
-    esac
+    tmux attach-session -t "$AIDEV_SESSION_NAME"
 }
 
-# Create new session and run command
+# Create new tmux session and run command
 create_session() {
     local full_cmd="$1"
     local workdir="$2"
-    case "$AIDEV_MULTIPLEXER" in
-        screen)
-            # screen -c /dev/null avoids loading user's .screenrc which may cause issues
-            screen -S "$AIDEV_SESSION_NAME" -c /dev/null bash -c "cd '$workdir' && $full_cmd; exec bash"
-            ;;
-        tmux)
-            tmux new-session -s "$AIDEV_SESSION_NAME" -c "$workdir" "$full_cmd"
-            ;;
-    esac
+    tmux new-session -s "$AIDEV_SESSION_NAME" -c "$workdir" "$full_cmd"
 }
 
-# Create new window in session and run command
+# Create new window in tmux session and run command
 create_session_window() {
     local full_cmd="$1"
     local workdir="$2"
-    case "$AIDEV_MULTIPLEXER" in
-        screen)
-            # Create window and run command, then attach
-            screen -S "$AIDEV_SESSION_NAME" -X screen bash -c "cd '$workdir' && $full_cmd; exec bash"
-            screen -r "$AIDEV_SESSION_NAME"
-            ;;
-        tmux)
-            tmux new-window -t "$AIDEV_SESSION_NAME" -c "$workdir" "$full_cmd"
-            tmux attach-session -t "$AIDEV_SESSION_NAME"
-            ;;
-    esac
+    tmux new-window -t "$AIDEV_SESSION_NAME" -c "$workdir" "$full_cmd"
+    tmux attach-session -t "$AIDEV_SESSION_NAME"
 }
 
-# Ensure we're running inside the multiplexer, start/attach if not
+# Ensure we're running inside tmux, start/attach if not
 ensure_multiplexer() {
-    # Already inside multiplexer, nothing to do
+    # Already inside tmux, nothing to do
     if inside_multiplexer; then
         return 0
     fi
     
-    # Not inside multiplexer - need to start or attach to session and re-exec
-    info "Not running inside $AIDEV_MULTIPLEXER, starting session '$AIDEV_SESSION_NAME'..."
+    # Not inside tmux - need to start or attach to session and re-exec
+    info "Not running inside tmux, starting session '$AIDEV_SESSION_NAME'..."
     
     # Get the full command to re-execute
     local script_path
@@ -234,20 +206,18 @@ ensure_multiplexer() {
         create_session_window "$full_cmd" "$workdir"
     else
         # Create new session and run the command
-        info "Creating new $AIDEV_MULTIPLEXER session..."
+        info "Creating new tmux session..."
         create_session "$full_cmd" "$workdir"
     fi
     
-    # If we get here, multiplexer has exited, so we should too
+    # If we get here, tmux has exited, so we should too
     exit 0
 }
 
-# Check if a worktree exists for a feature
+# Check if a worktree exists for a feature/branch
 worktree_exists() {
     local feature="$1"
-    local worktree_path
-    worktree_path="$(get_worktree_path "$feature")"
-    [[ -d "$worktree_path" ]]
+    [[ -n "$(get_worktree_path_for_branch "$feature")" ]]
 }
 
 # Check if a window exists for a feature
@@ -255,68 +225,33 @@ window_exists() {
     local feature="$1"
     local window_name
     window_name="$(get_window_name "$feature")"
-    case "$AIDEV_MULTIPLEXER" in
-        screen)
-            screen -S "$AIDEV_SESSION_NAME" -Q windows 2>/dev/null | grep -q "$window_name"
-            ;;
-        tmux)
-            tmux list-windows -t "$AIDEV_SESSION_NAME" -F '#{window_name}' 2>/dev/null | grep -q "^${window_name}$"
-            ;;
-    esac
+    tmux list-windows -t "$AIDEV_SESSION_NAME" -F '#{window_name}' 2>/dev/null | grep -q "^${window_name}$"
 }
 
-# Create a new window and optionally run a command
+# Create a new tmux window and optionally run a command
 new_window() {
     local window_name="$1"
     local workdir="$2"
-    case "$AIDEV_MULTIPLEXER" in
-        screen)
-            screen -S "$AIDEV_SESSION_NAME" -X screen -t "$window_name" bash -c "cd '$workdir'; exec bash"
-            ;;
-        tmux)
-            tmux new-window -n "$window_name" -c "$workdir"
-            ;;
-    esac
+    tmux new-window -n "$window_name" -c "$workdir"
 }
 
-# Select/focus a window
+# Select/focus a tmux window
 select_window() {
     local window_name="$1"
-    case "$AIDEV_MULTIPLEXER" in
-        screen)
-            screen -S "$AIDEV_SESSION_NAME" -X select "$window_name"
-            ;;
-        tmux)
-            tmux select-window -t "$window_name"
-            ;;
-    esac
+    tmux select-window -t "$window_name"
 }
 
-# Send keys/command to a window
+# Send keys/command to a tmux window
 send_keys() {
     local window_name="$1"
     local keys="$2"
-    case "$AIDEV_MULTIPLEXER" in
-        screen)
-            screen -S "$AIDEV_SESSION_NAME" -p "$window_name" -X stuff "$keys\n"
-            ;;
-        tmux)
-            tmux send-keys -t "$window_name" "$keys" Enter
-            ;;
-    esac
+    tmux send-keys -t "$window_name" "$keys" Enter
 }
 
-# Kill/close a window
+# Kill/close a tmux window
 kill_window() {
     local window_name="$1"
-    case "$AIDEV_MULTIPLEXER" in
-        screen)
-            screen -S "$AIDEV_SESSION_NAME" -p "$window_name" -X kill 2>/dev/null || true
-            ;;
-        tmux)
-            tmux kill-window -t "$window_name" 2>/dev/null || true
-            ;;
-    esac
+    tmux kill-window -t "$window_name" 2>/dev/null || true
 }
 
 # Run pre-hook script if it exists
@@ -371,14 +306,14 @@ cmd_new() {
     
     ensure_multiplexer
     
-    local git_root worktree_path window_name branch_name
+    local git_root window_name branch_name worktree_path
     git_root="$(get_git_root)"
-    worktree_path="$(get_worktree_path "$feature")"
     window_name="$(get_window_name "$feature")"
     branch_name="$feature"
     
     # Check if worktree already exists
     if worktree_exists "$feature"; then
+        worktree_path="$(get_worktree_path_for_branch "$feature")"
         warn "Worktree already exists at $worktree_path"
         if window_exists "$feature"; then
             info "Attaching to existing window..."
@@ -386,6 +321,9 @@ cmd_new() {
             exit 0
         fi
     else
+        # Construct path for new worktree
+        worktree_path="$(make_worktree_path "$feature")"
+        
         # Create worktree directory parent if needed
         mkdir -p "$(dirname "$worktree_path")"
         
@@ -455,38 +393,40 @@ cmd_list() {
     echo "=============================="
     echo ""
     
-    # Get all worktrees for this repo
     local found=false
+    local wt_path="" wt_branch=""
+    
     while IFS= read -r line; do
-        local wt_path wt_branch
-        wt_path="$(echo "$line" | awk '{print $1}')"
-        wt_branch="$(echo "$line" | awk '{print $3}' | tr -d '[]')"
-        
-        # Skip the main worktree
-        if [[ "$wt_path" == "$git_root" ]]; then
-            continue
-        fi
-        
-        # Only show worktrees in our managed directory
-        if [[ "$wt_path" == "$worktree_base"/* ]]; then
-            found=true
-            local feature window_name window_status
-            feature="$(basename "$wt_path")"
-            window_name="$(get_window_name "$feature")"
-            
-            if window_exists "$feature"; then
-                window_status="${GREEN}active${NC}"
-            else
-                window_status="${YELLOW}no window${NC}"
-            fi
-            
-            echo -e "  ${BLUE}$feature${NC}"
-            echo -e "    Branch:  $wt_branch"
-            echo -e "    Path:    $wt_path"
-            echo -e "    Window:  $window_status"
-            echo ""
-        fi
-    done < <(git -C "$git_root" worktree list)
+        case "$line" in
+            worktree\ *)
+                wt_path="${line#worktree }"
+                ;;
+            branch\ *)
+                wt_branch="${line#branch refs/heads/}"
+                
+                # Skip main worktree, only show managed ones
+                if [[ "$wt_path" != "$git_root" && "$wt_path" == "$worktree_base"/* ]]; then
+                    found=true
+                    local feature="$wt_branch"
+                    local window_name window_status
+                    window_name="$(get_window_name "$feature")"
+                    
+                    if window_exists "$feature"; then
+                        window_status="${GREEN}active${NC}"
+                    else
+                        window_status="${YELLOW}no window${NC}"
+                    fi
+                    
+                    echo -e "  ${BLUE}$feature${NC}"
+                    echo -e "    Branch:  $wt_branch"
+                    echo -e "    Path:    $wt_path"
+                    echo -e "    Window:  $window_status"
+                    echo ""
+                fi
+                wt_path="" wt_branch=""
+                ;;
+        esac
+    done < <(git -C "$git_root" worktree list --porcelain 2>/dev/null)
     
     if [[ "$found" == false ]]; then
         echo "  No active feature sessions."
@@ -509,9 +449,9 @@ cmd_attach() {
     
     local window_name worktree_path
     window_name="$(get_window_name "$feature")"
-    worktree_path="$(get_worktree_path "$feature")"
+    worktree_path="$(get_worktree_path_for_branch "$feature")"
     
-    if ! worktree_exists "$feature"; then
+    if [[ -z "$worktree_path" ]]; then
         error "No worktree found for feature '$feature'"
         info "Use 'aidev list' to see available features"
         exit 1
@@ -549,7 +489,7 @@ cmd_cleanup() {
     
     local git_root worktree_path window_name
     git_root="$(get_git_root)"
-    worktree_path="$(get_worktree_path "$feature")"
+    worktree_path="$(get_worktree_path_for_branch "$feature")"
     window_name="$(get_window_name "$feature")"
     
     # Close window if it exists
@@ -560,7 +500,7 @@ cmd_cleanup() {
     fi
     
     # Remove worktree if it exists
-    if worktree_exists "$feature"; then
+    if [[ -n "$worktree_path" ]]; then
         info "Removing worktree at $worktree_path..."
         if [[ "$force" == "--force" ]] || [[ "$force" == "-f" ]]; then
             git -C "$git_root" worktree remove --force "$worktree_path"
@@ -594,24 +534,25 @@ cmd_cleanup_all() {
         exit 0
     fi
     
-    # Find all worktrees in our managed directory
+    local wt_path="" wt_branch=""
+    
     while IFS= read -r line; do
-        local wt_path
-        wt_path="$(echo "$line" | awk '{print $1}')"
-        
-        # Skip the main worktree
-        if [[ "$wt_path" == "$git_root" ]]; then
-            continue
-        fi
-        
-        # Only clean worktrees in our managed directory
-        if [[ "$wt_path" == "$worktree_base"/* ]]; then
-            local feature
-            feature="$(basename "$wt_path")"
-            info "Cleaning up '$feature'..."
-            cmd_cleanup "$feature" "$force"
-        fi
-    done < <(git -C "$git_root" worktree list)
+        case "$line" in
+            worktree\ *)
+                wt_path="${line#worktree }"
+                ;;
+            branch\ *)
+                wt_branch="${line#branch refs/heads/}"
+                
+                # Skip main worktree, only clean managed ones
+                if [[ "$wt_path" != "$git_root" && "$wt_path" == "$worktree_base"/* ]]; then
+                    info "Cleaning up '$wt_branch'..."
+                    cmd_cleanup "$wt_branch" "$force"
+                fi
+                wt_path="" wt_branch=""
+                ;;
+        esac
+    done < <(git -C "$git_root" worktree list --porcelain 2>/dev/null)
     
     success "All features cleaned up!"
 }
@@ -629,9 +570,9 @@ cmd_cd() {
     fi
     
     local worktree_path
-    worktree_path="$(get_worktree_path "$feature")"
+    worktree_path="$(get_worktree_path_for_branch "$feature")"
     
-    if ! worktree_exists "$feature"; then
+    if [[ -z "$worktree_path" || ! -d "$worktree_path" ]]; then
         error "No worktree found for feature '$feature'"
         info "Use 'aidev list' to see available features"
         exit 1
@@ -644,7 +585,7 @@ cmd_cd() {
 # Show help
 cmd_help() {
     cat << 'EOF'
-aidev - AI-powered parallel development with git worktrees and screen/tmux
+aidev - AI-powered parallel development with git worktrees and tmux
 
 USAGE:
     aidev <command> [options]
@@ -665,8 +606,7 @@ ENVIRONMENT VARIABLES:
     AIDEV_TOOL           AI tool to launch (default: opencode)
     AIDEV_BASE_BRANCH    Base branch for new worktrees (default: main)
     AIDEV_WORKTREE_DIR   Custom worktree directory
-    AIDEV_MULTIPLEXER    Terminal multiplexer: screen or tmux (default: screen)
-    AIDEV_SESSION_NAME   Session name (default: aidev)
+    AIDEV_SESSION_NAME   tmux session name (default: aidev)
     AIDEV_SESSION_PREFIX Prefix for window names (default: aidev)
 
 EXAMPLES:
@@ -699,9 +639,6 @@ EXAMPLES:
 
     # Use a different AI tool
     AIDEV_TOOL=amp aidev new my-feature
-
-    # Use tmux instead of screen
-    AIDEV_MULTIPLEXER=tmux aidev new my-feature
 
 SHELL INTEGRATION:
     To make 'aidev cd' change your shell's directory, add this to .bashrc/.zshrc:
@@ -744,7 +681,7 @@ HOOKS:
 WORKFLOW:
     1. Navigate to your git repository (or any worktree managed by aidev)
     2. Run 'aidev new <feature>' to start working on a feature
-       (screen/tmux session is started automatically if not already running)
+       (tmux session is started automatically if not already running)
     3. The tool creates a worktree, runs .aidev-pre (if present), opens a window, and launches your AI tool
     4. Work on multiple features by running 'aidev new' for each
     5. Use 'aidev list' to see all active features
