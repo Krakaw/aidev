@@ -20,7 +20,7 @@ AIDEV_TOOL="${AIDEV_TOOL:-opencode}"           # AI tool to launch (opencode, am
 AIDEV_BASE_BRANCH="${AIDEV_BASE_BRANCH:-main}" # Base branch for new worktrees
 AIDEV_WORKTREE_DIR="${AIDEV_WORKTREE_DIR:-}"   # Custom worktree directory (default: ../<repo>-worktrees)
 AIDEV_SESSION_PREFIX="${AIDEV_SESSION_PREFIX:-aidev}" # Prefix for window names
-AIDEV_SESSION_NAME="${AIDEV_SESSION_NAME:-aidev}"     # tmux session name
+AIDEV_SESSION_NAME="${AIDEV_SESSION_NAME:-}"          # tmux session name (default: aidev-<repo>)
 
 # Colors for output
 RED='\033[0;31m'
@@ -59,6 +59,15 @@ get_git_root() {
 # Get repository name from git root
 get_repo_name() {
     basename "$(get_git_root)"
+}
+
+# Get the tmux session name for this repository
+get_session_name() {
+    if [[ -n "$AIDEV_SESSION_NAME" ]]; then
+        echo "$AIDEV_SESSION_NAME"
+    else
+        echo "aidev-$(get_repo_name)"
+    fi
 }
 
 # Get the worktree base directory
@@ -155,7 +164,7 @@ select_feature() {
 
 # Check if tmux session exists
 session_exists() {
-    tmux has-session -t "$AIDEV_SESSION_NAME" 2>/dev/null
+    tmux has-session -t "$(get_session_name)" 2>/dev/null
 }
 
 # Check if we're inside tmux
@@ -165,22 +174,23 @@ inside_multiplexer() {
 
 # Attach to existing tmux session
 attach_session() {
-    tmux attach-session -t "$AIDEV_SESSION_NAME"
+    tmux attach-session -t "$(get_session_name)"
 }
 
 # Create new tmux session and run command
 create_session() {
     local full_cmd="$1"
     local workdir="$2"
-    tmux new-session -s "$AIDEV_SESSION_NAME" -c "$workdir" "$full_cmd"
+    tmux new-session -s "$(get_session_name)" -c "$workdir" "$full_cmd"
 }
 
 # Create new window in tmux session and run command
 create_session_window() {
     local full_cmd="$1"
     local workdir="$2"
-    tmux new-window -t "$AIDEV_SESSION_NAME" -c "$workdir" "$full_cmd"
-    tmux attach-session -t "$AIDEV_SESSION_NAME"
+    # Use -a to append window at next available index (avoids "index N in use" errors)
+    tmux new-window -a -t "$(get_session_name)" -c "$workdir" "$full_cmd"
+    tmux attach-session -t "$(get_session_name)"
 }
 
 # Ensure we're running inside tmux, start/attach if not
@@ -190,8 +200,11 @@ ensure_multiplexer() {
         return 0
     fi
     
+    local session_name
+    session_name="$(get_session_name)"
+    
     # Not inside tmux - need to start or attach to session and re-exec
-    info "Not running inside tmux, starting session '$AIDEV_SESSION_NAME'..."
+    info "Not running inside tmux, starting session '$session_name'..."
     
     # Get the full command to re-execute
     local script_path
@@ -225,7 +238,7 @@ window_exists() {
     local feature="$1"
     local window_name
     window_name="$(get_window_name "$feature")"
-    tmux list-windows -t "$AIDEV_SESSION_NAME" -F '#{window_name}' 2>/dev/null | grep -q "^${window_name}$"
+    tmux list-windows -t "$(get_session_name)" -F '#{window_name}' 2>/dev/null | grep -q "^${window_name}$"
 }
 
 # Create a new tmux window and optionally run a command
@@ -606,7 +619,7 @@ ENVIRONMENT VARIABLES:
     AIDEV_TOOL           AI tool to launch (default: opencode)
     AIDEV_BASE_BRANCH    Base branch for new worktrees (default: main)
     AIDEV_WORKTREE_DIR   Custom worktree directory
-    AIDEV_SESSION_NAME   tmux session name (default: aidev)
+    AIDEV_SESSION_NAME   tmux session name (default: aidev-<repo>)
     AIDEV_SESSION_PREFIX Prefix for window names (default: aidev)
 
 EXAMPLES:
