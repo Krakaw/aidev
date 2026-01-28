@@ -19,8 +19,7 @@ set -euo pipefail
 AIDEV_TOOL="${AIDEV_TOOL:-opencode}"           # AI tool to launch (opencode, amp, claude, etc.)
 AIDEV_BASE_BRANCH="${AIDEV_BASE_BRANCH:-main}" # Base branch for new worktrees
 AIDEV_WORKTREE_DIR="${AIDEV_WORKTREE_DIR:-}"   # Custom worktree directory (default: ../<repo>-worktrees)
-AIDEV_SESSION_PREFIX="${AIDEV_SESSION_PREFIX:-aidev}" # Prefix for window names
-AIDEV_SESSION_NAME="${AIDEV_SESSION_NAME:-}"          # tmux session name (default: aidev-<repo>)
+AIDEV_SESSION_NAME="${AIDEV_SESSION_NAME:-}"   # Base tmux session name (default: aidev-<repo>)
 
 # Colors for output
 RED='\033[0;31m'
@@ -62,11 +61,21 @@ get_repo_name() {
 }
 
 # Get the tmux session name for this repository
+# If feature is provided, return session name for that specific worktree
 get_session_name() {
+    local feature="${1:-}"
+    local base_name
+    
     if [[ -n "$AIDEV_SESSION_NAME" ]]; then
-        echo "$AIDEV_SESSION_NAME"
+        base_name="$AIDEV_SESSION_NAME"
     else
-        echo "aidev-$(get_repo_name)"
+        base_name="aidev-$(get_repo_name)"
+    fi
+    
+    if [[ -n "$feature" ]]; then
+        echo "${base_name}-${feature}"
+    else
+        echo "$base_name"
     fi
 }
 
@@ -104,12 +113,6 @@ get_worktree_path_for_branch() {
           if (b==want && index(wt, wt_base"/") == 1) { print wt; exit }
         }
       '
-}
-
-# Get window name for a feature
-get_window_name() {
-    local feature="$1"
-    echo "${AIDEV_SESSION_PREFIX}-${feature}"
 }
 
 # Get list of managed branch/feature names (one per line)
@@ -162,9 +165,10 @@ select_feature() {
     echo "$selected"
 }
 
-# Check if tmux session exists
+# Check if tmux session exists for a feature
 session_exists() {
-    tmux has-session -t "$(get_session_name)" 2>/dev/null
+    local feature="${1:-}"
+    tmux has-session -t "$(get_session_name "$feature")" 2>/dev/null
 }
 
 # Check if we're inside tmux
@@ -172,39 +176,68 @@ inside_multiplexer() {
     [[ -n "${TMUX:-}" ]]
 }
 
-# Attach to existing tmux session
+# Attach to existing tmux session for a feature
 attach_session() {
-    tmux attach-session -t "$(get_session_name)"
+    local feature="${1:-}"
+    tmux attach-session -t "$(get_session_name "$feature")"
 }
 
-# Create new tmux session and run command
+# Create new tmux session for a feature and run command
 create_session() {
     local full_cmd="$1"
     local workdir="$2"
-    tmux new-session -s "$(get_session_name)" -c "$workdir" "$full_cmd"
+    local feature="${3:-}"
+    tmux new-session -s "$(get_session_name "$feature")" -c "$workdir" "$full_cmd"
 }
 
-# Create new window in tmux session and run command
-create_session_window() {
-    local full_cmd="$1"
-    local workdir="$2"
-    # Use -a to append window at next available index (avoids "index N in use" errors)
-    tmux new-window -a -t "$(get_session_name)" -c "$workdir" "$full_cmd"
-    tmux attach-session -t "$(get_session_name)"
+# Create new tmux session for a feature (detached) and optionally run command
+create_session_detached() {
+    local workdir="$1"
+    local feature="$2"
+    local cmd="${3:-}"
+    local session_name
+    session_name="$(get_session_name "$feature")"
+    
+    if [[ -n "$cmd" ]]; then
+        tmux new-session -d -s "$session_name" -c "$workdir" "$cmd"
+    else
+        tmux new-session -d -s "$session_name" -c "$workdir"
+    fi
+}
+
+# Switch to or attach to a feature's session
+switch_to_session() {
+    local feature="$1"
+    local session_name
+    session_name="$(get_session_name "$feature")"
+    
+    if inside_multiplexer; then
+        tmux switch-client -t "$session_name"
+    else
+        tmux attach-session -t "$session_name"
+    fi
+}
+
+# Kill a feature's tmux session
+kill_session() {
+    local feature="$1"
+    tmux kill-session -t "$(get_session_name "$feature")" 2>/dev/null || true
 }
 
 # Ensure we're running inside tmux, start/attach if not
+# Uses a temporary "launcher" session to re-exec the command inside tmux
 ensure_multiplexer() {
     # Already inside tmux, nothing to do
     if inside_multiplexer; then
         return 0
     fi
     
+    # Use a launcher session name (base name without feature)
     local session_name
-    session_name="$(get_session_name)"
+    session_name="$(get_session_name)-launcher"
     
-    # Not inside tmux - need to start or attach to session and re-exec
-    info "Not running inside tmux, starting session '$session_name'..."
+    # Not inside tmux - need to start a session and re-exec
+    info "Not running inside tmux, starting launcher session..."
     
     # Get the full command to re-execute
     local script_path
@@ -213,14 +246,14 @@ ensure_multiplexer() {
     local workdir
     workdir="$(pwd)"
     
-    if session_exists; then
-        # Session exists, create a new window and run the command there
-        info "Attaching to existing session..."
-        create_session_window "$full_cmd" "$workdir"
+    # Create or use launcher session to run the command
+    if tmux has-session -t "$session_name" 2>/dev/null; then
+        # Launcher session exists, create a new window for this command
+        tmux new-window -a -t "$session_name" -c "$workdir" "$full_cmd"
+        tmux attach-session -t "$session_name"
     else
-        # Create new session and run the command
-        info "Creating new tmux session..."
-        create_session "$full_cmd" "$workdir"
+        # Create new launcher session
+        tmux new-session -s "$session_name" -c "$workdir" "$full_cmd"
     fi
     
     # If we get here, tmux has exited, so we should too
@@ -233,38 +266,11 @@ worktree_exists() {
     [[ -n "$(get_worktree_path_for_branch "$feature")" ]]
 }
 
-# Check if a window exists for a feature
-window_exists() {
+# Send keys/command to a feature's tmux session
+send_keys_to_session() {
     local feature="$1"
-    local window_name
-    window_name="$(get_window_name "$feature")"
-    tmux list-windows -t "$(get_session_name)" -F '#{window_name}' 2>/dev/null | grep -q "^${window_name}$"
-}
-
-# Create a new tmux window and optionally run a command
-new_window() {
-    local window_name="$1"
-    local workdir="$2"
-    tmux new-window -n "$window_name" -c "$workdir"
-}
-
-# Select/focus a tmux window
-select_window() {
-    local window_name="$1"
-    tmux select-window -t "$window_name"
-}
-
-# Send keys/command to a tmux window
-send_keys() {
-    local window_name="$1"
     local keys="$2"
-    tmux send-keys -t "$window_name" "$keys" Enter
-}
-
-# Kill/close a tmux window
-kill_window() {
-    local window_name="$1"
-    tmux kill-window -t "$window_name" 2>/dev/null || true
+    tmux send-keys -t "$(get_session_name "$feature")" "$keys" Enter
 }
 
 # Run pre-hook script if it exists
@@ -307,7 +313,7 @@ run_pre_hook() {
     fi
 }
 
-# Create a new feature worktree and window
+# Create a new feature worktree and session
 cmd_new() {
     local feature="${1:-}"
     local base_branch="${2:-$AIDEV_BASE_BRANCH}"
@@ -317,20 +323,18 @@ cmd_new() {
         exit 1
     fi
     
-    ensure_multiplexer
-    
-    local git_root window_name branch_name worktree_path
+    local git_root session_name branch_name worktree_path
     git_root="$(get_git_root)"
-    window_name="$(get_window_name "$feature")"
+    session_name="$(get_session_name "$feature")"
     branch_name="$feature"
     
     # Check if worktree already exists
     if worktree_exists "$feature"; then
         worktree_path="$(get_worktree_path_for_branch "$feature")"
         warn "Worktree already exists at $worktree_path"
-        if window_exists "$feature"; then
-            info "Attaching to existing window..."
-            select_window "$window_name"
+        if session_exists "$feature"; then
+            info "Switching to existing session..."
+            switch_to_session "$feature"
             exit 0
         fi
     else
@@ -373,25 +377,28 @@ cmd_new() {
         fi
     fi
     
-    # Create window if it doesn't exist
-    if window_exists "$feature"; then
-        info "Window '$window_name' already exists, selecting it..."
-        select_window "$window_name"
+    # Create session if it doesn't exist
+    if session_exists "$feature"; then
+        info "Session '$session_name' already exists, switching to it..."
+        switch_to_session "$feature"
     else
-        info "Creating window '$window_name'..."
-        new_window "$window_name" "$worktree_path"
+        info "Creating session '$session_name'..."
+        create_session_detached "$worktree_path" "$feature"
         
         # Launch the AI tool
         info "Launching $AIDEV_TOOL..."
-        send_keys "$window_name" "$AIDEV_TOOL"
+        send_keys_to_session "$feature" "$AIDEV_TOOL"
         
         success "Feature '$feature' is ready!"
+        
+        # Switch to the new session
+        switch_to_session "$feature"
     fi
     
     echo ""
     info "Worktree: $worktree_path"
     info "Branch:   $branch_name"
-    info "Window:   $window_name"
+    info "Session:  $session_name"
     info "AI Tool:  $AIDEV_TOOL"
 }
 
@@ -421,19 +428,19 @@ cmd_list() {
                 if [[ "$wt_path" != "$git_root" && "$wt_path" == "$worktree_base"/* ]]; then
                     found=true
                     local feature="$wt_branch"
-                    local window_name window_status
-                    window_name="$(get_window_name "$feature")"
+                    local session_name session_status
+                    session_name="$(get_session_name "$feature")"
                     
-                    if window_exists "$feature"; then
-                        window_status="${GREEN}active${NC}"
+                    if session_exists "$feature"; then
+                        session_status="${GREEN}active${NC}"
                     else
-                        window_status="${YELLOW}no window${NC}"
+                        session_status="${YELLOW}no session${NC}"
                     fi
                     
                     echo -e "  ${BLUE}$feature${NC}"
-                    echo -e "    Branch:  $wt_branch"
-                    echo -e "    Path:    $wt_path"
-                    echo -e "    Window:  $window_status"
+                    echo -e "    Branch:   $wt_branch"
+                    echo -e "    Path:     $wt_path"
+                    echo -e "    Session:  $session_status"
                     echo ""
                 fi
                 wt_path="" wt_branch=""
@@ -451,6 +458,9 @@ cmd_list() {
 
 # Attach to an existing feature session
 cmd_attach() {
+    # Ensure we're in tmux first (before fzf selection to avoid double prompt)
+    ensure_multiplexer
+    
     local feature="${1:-}"
     
     # If no feature provided, use fzf to select one
@@ -458,10 +468,8 @@ cmd_attach() {
         feature="$(select_feature "Attach to feature")"
     fi
     
-    ensure_multiplexer
-    
-    local window_name worktree_path
-    window_name="$(get_window_name "$feature")"
+    local session_name worktree_path
+    session_name="$(get_session_name "$feature")"
     worktree_path="$(get_worktree_path_for_branch "$feature")"
     
     if [[ -z "$worktree_path" ]]; then
@@ -470,21 +478,23 @@ cmd_attach() {
         exit 1
     fi
     
-    if window_exists "$feature"; then
-        info "Switching to window '$window_name'..."
-        select_window "$window_name"
+    if session_exists "$feature"; then
+        info "Switching to session '$session_name'..."
+        switch_to_session "$feature"
     else
-        info "Window doesn't exist, creating it..."
-        new_window "$window_name" "$worktree_path"
+        info "Session doesn't exist, creating it..."
+        create_session_detached "$worktree_path" "$feature"
         
         info "Launching $AIDEV_TOOL..."
-        send_keys "$window_name" "$AIDEV_TOOL"
+        send_keys_to_session "$feature" "$AIDEV_TOOL"
+        
+        switch_to_session "$feature"
     fi
     
     success "Attached to '$feature'"
 }
 
-# Cleanup a feature (remove worktree and close window)
+# Cleanup a feature (remove worktree and close session)
 cmd_cleanup() {
     local feature="${1:-}"
     local force="${2:-}"
@@ -500,16 +510,16 @@ cmd_cleanup() {
         feature="$(select_feature "Cleanup feature")"
     fi
     
-    local git_root worktree_path window_name
+    local git_root worktree_path session_name
     git_root="$(get_git_root)"
     worktree_path="$(get_worktree_path_for_branch "$feature")"
-    window_name="$(get_window_name "$feature")"
+    session_name="$(get_session_name "$feature")"
     
-    # Close window if it exists
-    if window_exists "$feature"; then
-        info "Closing window '$window_name'..."
-        kill_window "$window_name"
-        success "Closed window"
+    # Close session if it exists
+    if session_exists "$feature"; then
+        info "Closing session '$session_name'..."
+        kill_session "$feature"
+        success "Closed session"
     fi
     
     # Remove worktree if it exists
@@ -538,7 +548,7 @@ cmd_cleanup_all() {
     git_root="$(get_git_root)"
     worktree_base="$(get_worktree_base)"
     
-    warn "This will remove ALL aidev worktrees and windows!"
+    warn "This will remove ALL aidev worktrees and sessions!"
     read -p "Are you sure? [y/N] " -n 1 -r
     echo
     
@@ -604,12 +614,12 @@ USAGE:
     aidev <command> [options]
 
 COMMANDS:
-    new|add <feature> [base-branch]   Create new worktree, window, and launch AI tool
+    new|add <feature> [base-branch]   Create new worktree, session, and launch AI tool
     list                              List all active feature sessions
     attach [feature]                  Attach to an existing feature session
-    cd [feature]                      Print worktree path (for use with cd)
-    cleanup [feature] [--force]       Remove worktree and close window
-    cleanup-all [--force]             Remove all worktrees and close all windows
+    cd [feature]                      Print worktree path (use: cd "$(aidev cd)")
+    cleanup [feature] [--force]       Remove worktree and close session
+    cleanup-all [--force]             Remove all worktrees and close all sessions
     help                              Show this help message
 
     For 'attach', 'cd', and 'cleanup', if no feature is specified, an interactive
@@ -619,8 +629,8 @@ ENVIRONMENT VARIABLES:
     AIDEV_TOOL           AI tool to launch (default: opencode)
     AIDEV_BASE_BRANCH    Base branch for new worktrees (default: main)
     AIDEV_WORKTREE_DIR   Custom worktree directory
-    AIDEV_SESSION_NAME   tmux session name (default: aidev-<repo>)
-    AIDEV_SESSION_PREFIX Prefix for window names (default: aidev)
+    AIDEV_SESSION_NAME   Base tmux session name (default: aidev-<repo>)
+                         Feature sessions are named: <base>-<feature>
 
 EXAMPLES:
     # Start working on a new feature
@@ -694,9 +704,9 @@ HOOKS:
 WORKFLOW:
     1. Navigate to your git repository (or any worktree managed by aidev)
     2. Run 'aidev new <feature>' to start working on a feature
-       (tmux session is started automatically if not already running)
-    3. The tool creates a worktree, runs .aidev-pre (if present), opens a window, and launches your AI tool
-    4. Work on multiple features by running 'aidev new' for each
+       (creates a dedicated tmux session for that feature)
+    3. The tool creates a worktree, runs .aidev-pre (if present), opens a session, and launches your AI tool
+    4. Work on multiple features by running 'aidev new' for each (each gets its own session)
     5. Use 'aidev list' to see all active features
     6. Use 'aidev attach' to switch between features (fzf selection or specify name)
     7. When done, merge via git/GitHub and run 'aidev cleanup'
