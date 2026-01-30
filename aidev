@@ -20,7 +20,7 @@ set -euo pipefail
 
 # Configuration (can be overridden via environment variables)
 AIDEV_TOOL="${AIDEV_TOOL:-opencode}"           # AI tool to launch (opencode, amp, claude, etc.)
-AIDEV_BASE_BRANCH="${AIDEV_BASE_BRANCH:-main}" # Base branch for new worktrees
+AIDEV_BASE_BRANCH="${AIDEV_BASE_BRANCH:-}"     # Base branch for new worktrees (auto-detected if empty)
 AIDEV_WORKTREE_DIR="${AIDEV_WORKTREE_DIR:-}"   # Custom worktree directory (default: ../<repo>-worktrees)
 AIDEV_SESSION_NAME="${AIDEV_SESSION_NAME:-}"   # Base tmux session name (default: aidev-<repo>)
 
@@ -61,6 +61,38 @@ get_git_root() {
 # Get repository name from git root
 get_repo_name() {
     basename "$(get_git_root)"
+}
+
+# Get the primary branch of the repository
+# Checks origin/HEAD first, then falls back to common branch names
+get_primary_branch() {
+    local git_root
+    git_root="$(get_git_root)"
+    
+    # If AIDEV_BASE_BRANCH is set, use it
+    if [[ -n "$AIDEV_BASE_BRANCH" ]]; then
+        echo "$AIDEV_BASE_BRANCH"
+        return
+    fi
+    
+    # Try to get the default branch from origin/HEAD
+    local ref
+    ref="$(git -C "$git_root" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null)" && {
+        echo "${ref#refs/remotes/origin/}"
+        return
+    }
+    
+    # Fallback: check for common primary branch names
+    for branch in main master; do
+        if git -C "$git_root" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null || \
+           git -C "$git_root" show-ref --verify --quiet "refs/remotes/origin/$branch" 2>/dev/null; then
+            echo "$branch"
+            return
+        fi
+    done
+    
+    # Last resort fallback
+    echo "main"
 }
 
 # Get the tmux session name for this repository
@@ -319,7 +351,7 @@ run_pre_hook() {
 # Create a new feature worktree and session
 cmd_new() {
     local feature="${1:-}"
-    local base_branch="${2:-$AIDEV_BASE_BRANCH}"
+    local base_branch="${2:-$(get_primary_branch)}"
     
     if [[ -z "$feature" ]]; then
         error "Usage: aidev new <feature-name> [base-branch]"
@@ -777,7 +809,7 @@ COMMANDS:
 
 ENVIRONMENT VARIABLES:
     AIDEV_TOOL           AI tool to launch (default: opencode)
-    AIDEV_BASE_BRANCH    Base branch for new worktrees (default: main)
+    AIDEV_BASE_BRANCH    Base branch for new worktrees (auto-detected from origin/HEAD)
     AIDEV_WORKTREE_DIR   Custom worktree directory
     AIDEV_SESSION_NAME   Base tmux session name (default: aidev-<repo>)
                          Feature sessions are named: <base>-<feature>
