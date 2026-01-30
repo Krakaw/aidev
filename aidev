@@ -8,7 +8,10 @@
 #   new <feature>     Create a new worktree, window, and launch AI tool
 #   list              List all active feature sessions
 #   attach [feature]  Attach to an existing feature session (fzf if not specified)
+#   status [feature]  Show detailed status of a feature (fzf if not specified)
 #   cd [feature]      Print worktree path for cd (fzf if not specified)
+#   git [feature] ... Run git commands in a feature's worktree (fzf if not specified)
+#   pull [feature]    Update feature with latest from base branch
 #   cleanup [feature] Remove worktree and close window (fzf if not specified)
 #   cleanup-all       Remove all worktrees and close all feature windows
 #
@@ -605,6 +608,149 @@ cmd_cd() {
     echo "$worktree_path"
 }
 
+# Show detailed status of a specific feature
+cmd_status() {
+    local feature="${1:-}"
+    
+    # If no feature provided, use fzf to select one
+    if [[ -z "$feature" ]]; then
+        feature="$(select_feature "Status of feature")"
+    fi
+    
+    local git_root worktree_path session_name
+    git_root="$(get_git_root)"
+    worktree_path="$(get_worktree_path_for_branch "$feature")"
+    session_name="$(get_session_name "$feature")"
+    
+    if [[ -z "$worktree_path" ]]; then
+        error "No worktree found for feature '$feature'"
+        info "Use 'aidev list' to see available features"
+        exit 1
+    fi
+    
+    echo ""
+    echo -e "${BLUE}Feature Status: $feature${NC}"
+    echo "======================================"
+    echo ""
+    
+    # Basic info
+    echo -e "  ${GREEN}Worktree:${NC}  $worktree_path"
+    echo -e "  ${GREEN}Branch:${NC}    $feature"
+    echo -e "  ${GREEN}Session:${NC}   $session_name"
+    
+    # Session status
+    if session_exists "$feature"; then
+        echo -e "  ${GREEN}Status:${NC}    ${GREEN}active${NC}"
+    else
+        echo -e "  ${GREEN}Status:${NC}    ${YELLOW}no session${NC}"
+    fi
+    echo ""
+    
+    # Git status
+    echo -e "  ${BLUE}Git Status:${NC}"
+    local git_status
+    git_status="$(git -C "$worktree_path" status --porcelain 2>/dev/null)"
+    if [[ -z "$git_status" ]]; then
+        echo -e "    ${GREEN}Clean working directory${NC}"
+    else
+        local modified added deleted untracked
+        modified=$(echo "$git_status" | grep -c '^ M\|^M ' 2>/dev/null || echo 0)
+        added=$(echo "$git_status" | grep -c '^A \|^AM' 2>/dev/null || echo 0)
+        deleted=$(echo "$git_status" | grep -c '^ D\|^D ' 2>/dev/null || echo 0)
+        untracked=$(echo "$git_status" | grep -c '^??' 2>/dev/null || echo 0)
+        
+        [[ $modified -gt 0 ]] && echo -e "    ${YELLOW}Modified:${NC}   $modified files"
+        [[ $added -gt 0 ]] && echo -e "    ${GREEN}Added:${NC}      $added files"
+        [[ $deleted -gt 0 ]] && echo -e "    ${RED}Deleted:${NC}    $deleted files"
+        [[ $untracked -gt 0 ]] && echo -e "    ${BLUE}Untracked:${NC}  $untracked files"
+    fi
+    echo ""
+    
+    # Commits ahead/behind
+    echo -e "  ${BLUE}Branch Comparison:${NC}"
+    local ahead behind
+    ahead=$(git -C "$worktree_path" rev-list --count "origin/$AIDEV_BASE_BRANCH..$feature" 2>/dev/null || echo "?")
+    behind=$(git -C "$worktree_path" rev-list --count "$feature..origin/$AIDEV_BASE_BRANCH" 2>/dev/null || echo "?")
+    echo -e "    ${GREEN}Ahead:${NC}  $ahead commits from $AIDEV_BASE_BRANCH"
+    echo -e "    ${YELLOW}Behind:${NC} $behind commits from $AIDEV_BASE_BRANCH"
+    echo ""
+    
+    # Last commit
+    echo -e "  ${BLUE}Last Commit:${NC}"
+    local last_commit
+    last_commit=$(git -C "$worktree_path" log -1 --format="    %h %s (%ar)" 2>/dev/null || echo "    (no commits)")
+    echo "$last_commit"
+    echo ""
+}
+
+# Run git command in the context of a feature's worktree
+cmd_git() {
+    local feature="${1:-}"
+    
+    # If first arg looks like a git command, use fzf for feature
+    if [[ -z "$feature" ]] || [[ "$feature" == -* ]] || [[ "$feature" =~ ^(status|log|diff|show|branch|checkout|pull|push|fetch|commit|add|reset|stash|rebase|merge|cherry-pick)$ ]]; then
+        # Put feature back in args if it was a git command
+        if [[ -n "$feature" ]]; then
+            set -- "$feature" "$@"
+        fi
+        feature="$(select_feature "Run git in feature")"
+    else
+        shift  # Remove feature from args
+    fi
+    
+    local worktree_path
+    worktree_path="$(get_worktree_path_for_branch "$feature")"
+    
+    if [[ -z "$worktree_path" ]]; then
+        error "No worktree found for feature '$feature'"
+        info "Use 'aidev list' to see available features"
+        exit 1
+    fi
+    
+    # Run git command in worktree context
+    git -C "$worktree_path" "$@"
+}
+
+# Pull/rebase feature branch with latest from base branch
+cmd_pull() {
+    local feature="${1:-}"
+    local rebase="${2:-}"
+    
+    # Handle --rebase as first argument
+    if [[ "$feature" == "--rebase" ]] || [[ "$feature" == "-r" ]]; then
+        rebase="$feature"
+        feature=""
+    fi
+    
+    # If no feature provided, use fzf to select one
+    if [[ -z "$feature" ]]; then
+        feature="$(select_feature "Pull into feature")"
+    fi
+    
+    local git_root worktree_path
+    git_root="$(get_git_root)"
+    worktree_path="$(get_worktree_path_for_branch "$feature")"
+    
+    if [[ -z "$worktree_path" ]]; then
+        error "No worktree found for feature '$feature'"
+        info "Use 'aidev list' to see available features"
+        exit 1
+    fi
+    
+    info "Fetching latest from origin..."
+    git -C "$worktree_path" fetch origin "$AIDEV_BASE_BRANCH"
+    
+    if [[ "$rebase" == "--rebase" ]] || [[ "$rebase" == "-r" ]]; then
+        info "Rebasing '$feature' onto 'origin/$AIDEV_BASE_BRANCH'..."
+        git -C "$worktree_path" rebase "origin/$AIDEV_BASE_BRANCH"
+    else
+        info "Merging 'origin/$AIDEV_BASE_BRANCH' into '$feature'..."
+        git -C "$worktree_path" merge "origin/$AIDEV_BASE_BRANCH" --no-edit
+    fi
+    
+    success "Updated '$feature' with latest from '$AIDEV_BASE_BRANCH'"
+}
+
 # Show help
 cmd_help() {
     cat << 'EOF'
@@ -617,13 +763,17 @@ COMMANDS:
     new|add <feature> [base-branch]   Create new worktree, session, and launch AI tool
     list                              List all active feature sessions
     attach [feature]                  Attach to an existing feature session
+    status [feature]                  Show detailed status of a feature
     cd [feature]                      Print worktree path (use: cd "$(aidev cd)")
+    git [feature] <git-args>          Run git command in feature's worktree
+    pull [feature] [--rebase]         Update feature with latest from base branch
     cleanup [feature] [--force]       Remove worktree and close session
     cleanup-all [--force]             Remove all worktrees and close all sessions
     help                              Show this help message
 
-    For 'attach', 'cd', and 'cleanup', if no feature is specified, an interactive
-    selector (fzf) will be shown to choose from existing worktrees.
+    For 'attach', 'cd', 'status', 'git', 'pull', and 'cleanup', if no feature is
+    specified, an interactive selector (fzf) will be shown to choose from
+    existing worktrees.
 
 ENVIRONMENT VARIABLES:
     AIDEV_TOOL           AI tool to launch (default: opencode)
@@ -642,11 +792,31 @@ EXAMPLES:
     # List all active features
     aidev list
 
+    # View detailed status of a feature (with fzf selection)
+    aidev status
+
+    # View status of a specific feature
+    aidev status add-user-auth
+
     # Switch to an existing feature (with fzf selection)
     aidev attach
 
     # Switch to a specific feature
     aidev attach add-user-auth
+
+    # Run git commands in a feature's worktree (with fzf selection)
+    aidev git status
+    aidev git log --oneline -5
+
+    # Run git commands in a specific feature's worktree
+    aidev git add-user-auth status
+    aidev git add-user-auth diff
+
+    # Update a feature with latest changes from base branch
+    aidev pull                    # merge (fzf selection)
+    aidev pull add-user-auth      # merge specific feature
+    aidev pull --rebase           # rebase (fzf selection)
+    aidev pull add-user-auth -r   # rebase specific feature
 
     # Change directory to a worktree (with fzf selection)
     cd "$(aidev cd)"
@@ -732,8 +902,17 @@ main() {
         attach|a)
             cmd_attach "$@"
             ;;
+        status|st)
+            cmd_status "$@"
+            ;;
         cd)
             cmd_cd "$@"
+            ;;
+        git|g)
+            cmd_git "$@"
+            ;;
+        pull|update)
+            cmd_pull "$@"
             ;;
         cleanup|clean|rm)
             cmd_cleanup "$@"
