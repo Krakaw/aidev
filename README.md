@@ -89,7 +89,7 @@ Configure `aidev` using environment variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AIDEV_TOOL` | `opencode` | AI tool to launch in each session |
-| `AIDEV_BASE_BRANCH` | `main` | Base branch for new worktrees |
+| `AIDEV_BASE_BRANCH` | auto-detected | Base branch for new worktrees (detects from `origin/HEAD`) |
 | `AIDEV_WORKTREE_DIR` | `../<repo>-worktrees` | Directory for worktrees |
 | `AIDEV_SESSION_NAME` | `aidev` | Tmux session name |
 | `AIDEV_SESSION_PREFIX` | `aidev` | Prefix for tmux window names |
