@@ -229,9 +229,29 @@ inside_multiplexer() {
     [[ -n "${TMUX:-}" ]]
 }
 
+# Set iTerm2 tab title if running in iTerm2
+set_iterm2_tab_title() {
+    local title="$1"
+    
+    # Check for iTerm2 - LC_TERMINAL persists inside tmux, TERM_PROGRAM doesn't
+    if [[ "${LC_TERMINAL:-}" == "iTerm2" || "${TERM_PROGRAM:-}" == "iTerm.app" ]]; then
+        if [[ -n "${TMUX:-}" ]]; then
+            # Inside tmux: enable passthrough and use iTerm2 proprietary sequence
+            tmux set-option -p allow-passthrough on 2>/dev/null || true
+            # Use iTerm2's SetUserVar or proprietary title sequence via passthrough
+            printf '\033Ptmux;\033\033]0;%s\007\033\\' "$title"
+        else
+            # Outside tmux: use iTerm2 proprietary escape to set tab title
+            # OSC 0 sets both window and tab title
+            printf '\033]0;%s\007' "$title"
+        fi
+    fi
+}
+
 # Attach to existing tmux session for a feature
 attach_session() {
     local feature="${1:-}"
+    set_iterm2_tab_title "$feature"
     tmux attach-session -t "$(get_session_name "$feature")"
 }
 
@@ -240,7 +260,12 @@ create_session() {
     local full_cmd="$1"
     local workdir="$2"
     local feature="${3:-}"
-    tmux new-session -s "$(get_session_name "$feature")" -c "$workdir" "$full_cmd"
+    tmux new-session -s "$(get_session_name "$feature")" -c "$workdir" \
+        -e "AIDEV_TOOL=$AIDEV_TOOL" \
+        -e "AIDEV_BASE_BRANCH=$AIDEV_BASE_BRANCH" \
+        -e "AIDEV_WORKTREE_DIR=$AIDEV_WORKTREE_DIR" \
+        -e "AIDEV_SESSION_NAME=$AIDEV_SESSION_NAME" \
+        "$full_cmd"
 }
 
 # Create new tmux session for a feature (detached) and optionally run command
@@ -252,9 +277,27 @@ create_session_detached() {
     session_name="$(get_session_name "$feature")"
     
     if [[ -n "$cmd" ]]; then
-        tmux new-session -d -s "$session_name" -c "$workdir" "$cmd"
+        tmux new-session -d -s "$session_name" -c "$workdir" \
+            -e "AIDEV_TOOL=$AIDEV_TOOL" \
+            -e "AIDEV_BASE_BRANCH=$AIDEV_BASE_BRANCH" \
+            -e "AIDEV_WORKTREE_DIR=$AIDEV_WORKTREE_DIR" \
+            -e "AIDEV_SESSION_NAME=$AIDEV_SESSION_NAME" \
+            "$cmd"
     else
-        tmux new-session -d -s "$session_name" -c "$workdir"
+        tmux new-session -d -s "$session_name" -c "$workdir" \
+            -e "AIDEV_TOOL=$AIDEV_TOOL" \
+            -e "AIDEV_BASE_BRANCH=$AIDEV_BASE_BRANCH" \
+            -e "AIDEV_WORKTREE_DIR=$AIDEV_WORKTREE_DIR" \
+            -e "AIDEV_SESSION_NAME=$AIDEV_SESSION_NAME"
+    fi
+    
+    # Configure session for iTerm2 integration
+    if [[ "${LC_TERMINAL:-}" == "iTerm2" || "${TERM_PROGRAM:-}" == "iTerm.app" ]]; then
+        # Enable passthrough so escape sequences reach iTerm2
+        tmux set-option -t "$session_name" allow-passthrough on 2>/dev/null || true
+        # Set the window title to the feature name and enable title propagation
+        tmux set-option -t "$session_name" set-titles on 2>/dev/null || true
+        tmux set-option -t "$session_name" set-titles-string "$feature" 2>/dev/null || true
     fi
 }
 
@@ -263,6 +306,16 @@ switch_to_session() {
     local feature="$1"
     local session_name
     session_name="$(get_session_name "$feature")"
+    
+    # Configure tmux session for iTerm2 title propagation (also handles older sessions)
+    if [[ "${LC_TERMINAL:-}" == "iTerm2" || "${TERM_PROGRAM:-}" == "iTerm.app" ]]; then
+        tmux set-option -t "$session_name" allow-passthrough on 2>/dev/null || true
+        tmux set-option -t "$session_name" set-titles on 2>/dev/null || true
+        tmux set-option -t "$session_name" set-titles-string "$feature" 2>/dev/null || true
+    fi
+    
+    # Set iTerm2 tab title directly as well
+    set_iterm2_tab_title "$feature"
     
     if inside_multiplexer; then
         tmux switch-client -t "$session_name"
@@ -302,11 +355,21 @@ ensure_multiplexer() {
     # Create or use launcher session to run the command
     if tmux has-session -t "$session_name" 2>/dev/null; then
         # Launcher session exists, create a new window for this command
-        tmux new-window -a -t "$session_name" -c "$workdir" "$full_cmd"
+        tmux new-window -a -t "$session_name" -c "$workdir" \
+            -e "AIDEV_TOOL=$AIDEV_TOOL" \
+            -e "AIDEV_BASE_BRANCH=$AIDEV_BASE_BRANCH" \
+            -e "AIDEV_WORKTREE_DIR=$AIDEV_WORKTREE_DIR" \
+            -e "AIDEV_SESSION_NAME=$AIDEV_SESSION_NAME" \
+            "$full_cmd"
         tmux attach-session -t "$session_name"
     else
         # Create new launcher session
-        tmux new-session -s "$session_name" -c "$workdir" "$full_cmd"
+        tmux new-session -s "$session_name" -c "$workdir" \
+            -e "AIDEV_TOOL=$AIDEV_TOOL" \
+            -e "AIDEV_BASE_BRANCH=$AIDEV_BASE_BRANCH" \
+            -e "AIDEV_WORKTREE_DIR=$AIDEV_WORKTREE_DIR" \
+            -e "AIDEV_SESSION_NAME=$AIDEV_SESSION_NAME" \
+            "$full_cmd"
     fi
     
     # If we get here, tmux has exited, so we should too
