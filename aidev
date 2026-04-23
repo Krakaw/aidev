@@ -18,11 +18,16 @@
 
 set -euo pipefail
 
+# Source user config if it exists (set env vars before defaults are applied)
+# shellcheck disable=SC1090
+[[ -f ~/.aidev ]] && source ~/.aidev
+
 # Configuration (can be overridden via environment variables)
 AIDEV_TOOL="${AIDEV_TOOL:-opencode}"           # AI tool to launch (opencode, amp, claude, etc.)
 AIDEV_BASE_BRANCH="${AIDEV_BASE_BRANCH:-}"     # Base branch for new worktrees (auto-detected if empty)
 AIDEV_WORKTREE_DIR="${AIDEV_WORKTREE_DIR:-}"   # Custom worktree directory (default: ../<repo>-worktrees)
 AIDEV_SESSION_NAME="${AIDEV_SESSION_NAME:-}"   # Base tmux session name (default: aidev-<repo>)
+AIDEV_NO_TMUX="${AIDEV_NO_TMUX:-}"            # Set to 1 to disable automatic tmux session management
 
 # Colors for output
 RED='\033[0;31m'
@@ -265,6 +270,7 @@ create_session() {
         -e "AIDEV_BASE_BRANCH=$AIDEV_BASE_BRANCH" \
         -e "AIDEV_WORKTREE_DIR=$AIDEV_WORKTREE_DIR" \
         -e "AIDEV_SESSION_NAME=$AIDEV_SESSION_NAME" \
+        -e "AIDEV_NO_TMUX=$AIDEV_NO_TMUX" \
         "$full_cmd"
 }
 
@@ -282,13 +288,15 @@ create_session_detached() {
             -e "AIDEV_BASE_BRANCH=$AIDEV_BASE_BRANCH" \
             -e "AIDEV_WORKTREE_DIR=$AIDEV_WORKTREE_DIR" \
             -e "AIDEV_SESSION_NAME=$AIDEV_SESSION_NAME" \
+            -e "AIDEV_NO_TMUX=$AIDEV_NO_TMUX" \
             "$cmd"
     else
         tmux new-session -d -s "$session_name" -c "$workdir" \
             -e "AIDEV_TOOL=$AIDEV_TOOL" \
             -e "AIDEV_BASE_BRANCH=$AIDEV_BASE_BRANCH" \
             -e "AIDEV_WORKTREE_DIR=$AIDEV_WORKTREE_DIR" \
-            -e "AIDEV_SESSION_NAME=$AIDEV_SESSION_NAME"
+            -e "AIDEV_SESSION_NAME=$AIDEV_SESSION_NAME" \
+            -e "AIDEV_NO_TMUX=$AIDEV_NO_TMUX"
     fi
     
     # Configure session for iTerm2 integration
@@ -333,6 +341,11 @@ kill_session() {
 # Ensure we're running inside tmux, start/attach if not
 # Uses a temporary "launcher" session to re-exec the command inside tmux
 ensure_multiplexer() {
+    # Skip if tmux is disabled
+    if [[ "${AIDEV_NO_TMUX:-}" == "1" ]]; then
+        return 0
+    fi
+
     # Already inside tmux, nothing to do
     if inside_multiplexer; then
         return 0
@@ -360,6 +373,7 @@ ensure_multiplexer() {
             -e "AIDEV_BASE_BRANCH=$AIDEV_BASE_BRANCH" \
             -e "AIDEV_WORKTREE_DIR=$AIDEV_WORKTREE_DIR" \
             -e "AIDEV_SESSION_NAME=$AIDEV_SESSION_NAME" \
+            -e "AIDEV_NO_TMUX=$AIDEV_NO_TMUX" \
             "$full_cmd"
         tmux attach-session -t "$session_name"
     else
@@ -369,6 +383,7 @@ ensure_multiplexer() {
             -e "AIDEV_BASE_BRANCH=$AIDEV_BASE_BRANCH" \
             -e "AIDEV_WORKTREE_DIR=$AIDEV_WORKTREE_DIR" \
             -e "AIDEV_SESSION_NAME=$AIDEV_SESSION_NAME" \
+            -e "AIDEV_NO_TMUX=$AIDEV_NO_TMUX" \
             "$full_cmd"
     fi
     
@@ -448,7 +463,10 @@ cmd_new() {
     if worktree_exists "$feature"; then
         worktree_path="$(get_worktree_path_for_branch "$feature")"
         warn "Worktree already exists at $worktree_path"
-        if session_exists "$feature"; then
+        if [[ "${AIDEV_NO_TMUX:-}" == "1" ]]; then
+            info "Launching $AIDEV_TOOL in $worktree_path..."
+            cd "$worktree_path" && "$AIDEV_TOOL"; exec "$SHELL"
+        elif session_exists "$feature"; then
             info "Switching to existing session..."
             switch_to_session "$feature"
             exit 0
@@ -497,23 +515,31 @@ cmd_new() {
     fi
     
     # Create session if it doesn't exist
-    if session_exists "$feature"; then
+    if [[ "${AIDEV_NO_TMUX:-}" == "1" ]]; then
+        success "Feature '$feature' is ready!"
+        echo ""
+        info "Worktree: $worktree_path"
+        info "Branch:   $branch_name"
+        info "AI Tool:  $AIDEV_TOOL"
+        info "Launching $AIDEV_TOOL..."
+        cd "$worktree_path" && "$AIDEV_TOOL"; exec "$SHELL"
+    elif session_exists "$feature"; then
         info "Session '$session_name' already exists, switching to it..."
         switch_to_session "$feature"
     else
         info "Creating session '$session_name'..."
         create_session_detached "$worktree_path" "$feature"
-        
+
         # Launch the AI tool
         info "Launching $AIDEV_TOOL..."
         send_keys_to_session "$feature" "$AIDEV_TOOL"
-        
+
         success "Feature '$feature' is ready!"
-        
+
         # Switch to the new session
         switch_to_session "$feature"
     fi
-    
+
     echo ""
     info "Worktree: $worktree_path"
     info "Branch:   $branch_name"
@@ -597,19 +623,22 @@ cmd_attach() {
         exit 1
     fi
     
-    if session_exists "$feature"; then
+    if [[ "${AIDEV_NO_TMUX:-}" == "1" ]]; then
+        info "Launching $AIDEV_TOOL in $worktree_path..."
+        cd "$worktree_path" && "$AIDEV_TOOL"; exec "$SHELL"
+    elif session_exists "$feature"; then
         info "Switching to session '$session_name'..."
         switch_to_session "$feature"
     else
         info "Session doesn't exist, creating it..."
         create_session_detached "$worktree_path" "$feature"
-        
+
         info "Launching $AIDEV_TOOL..."
         send_keys_to_session "$feature" "$AIDEV_TOOL"
-        
+
         switch_to_session "$feature"
     fi
-    
+
     success "Attached to '$feature'"
 }
 
@@ -921,12 +950,20 @@ COMMANDS:
     specified, an interactive selector (fzf) will be shown to choose from
     existing worktrees.
 
+CONFIGURATION:
+    ~/.aidev             Sourced at startup if it exists. Use this to set default
+                         environment variables. Example:
+                           AIDEV_TOOL=claude
+                           AIDEV_NO_TMUX=1
+
 ENVIRONMENT VARIABLES:
     AIDEV_TOOL           AI tool to launch (default: opencode)
     AIDEV_BASE_BRANCH    Base branch for new worktrees (auto-detected from origin/HEAD)
     AIDEV_WORKTREE_DIR   Custom worktree directory
     AIDEV_SESSION_NAME   Base tmux session name (default: aidev-<repo>)
                          Feature sessions are named: <base>-<feature>
+    AIDEV_NO_TMUX        Set to 1 to disable automatic tmux session management.
+                         The AI tool will be launched directly in the current terminal.
 
 EXAMPLES:
     # Start working on a new feature
