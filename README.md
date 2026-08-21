@@ -53,6 +53,9 @@ aidev <command> [options]
 # Start working on a new feature
 aidev new add-user-auth
 
+# Resume an existing branch (local or on origin) in a worktree
+aidev new feature/already-pushed
+
 # Start a feature based on a different branch
 aidev new hotfix-login release/v2
 
