@@ -5,7 +5,7 @@
 # Usage: aidev <command> [options]
 #
 # Commands:
-#   new <feature>     Create a new worktree, window, and launch AI tool
+#   new <feature> [base] [-b|--base <branch>]  Create a new worktree, window, and launch AI tool
 #   list              List all active feature sessions
 #   attach [feature]  Attach to an existing feature session (fzf if not specified)
 #   status [feature]  Show detailed status of a feature (fzf if not specified)
@@ -149,9 +149,10 @@ get_worktree_base() {
 }
 
 # Construct worktree path for a new feature (does not check if it exists)
+# The directory is named "<project>-<branch>" so worktrees are identifiable by repo.
 make_worktree_path() {
     local feature="$1"
-    echo "$(get_worktree_base)/$feature"
+    echo "$(get_worktree_base)/$(get_repo_name)-$feature"
 }
 
 # Get worktree path for a branch name (authoritative lookup from git)
@@ -446,11 +447,50 @@ run_pre_hook() {
 
 # Create a new feature worktree and session
 cmd_new() {
-    local feature="${1:-}"
-    local base_branch="${2:-$(get_primary_branch)}"
-    
+    local feature=""
+    local base_branch=""
+
+    # Parse args: feature name (positional), optional base branch (positional),
+    # and -b/--base flag (which takes precedence over the positional base branch)
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -b|--base)
+                if [[ -z "${2:-}" ]]; then
+                    error "Option '$1' requires a branch name"
+                    exit 1
+                fi
+                base_branch="$2"
+                shift 2
+                ;;
+            --base=*)
+                base_branch="${1#--base=}"
+                shift
+                ;;
+            -*)
+                error "Unknown option: $1"
+                error "Usage: aidev new <feature-name> [base-branch] [-b|--base <branch>]"
+                exit 1
+                ;;
+            *)
+                if [[ -z "$feature" ]]; then
+                    feature="$1"
+                elif [[ -z "$base_branch" ]]; then
+                    base_branch="$1"
+                else
+                    error "Unexpected argument: $1"
+                    error "Usage: aidev new <feature-name> [base-branch] [-b|--base <branch>]"
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Default the base branch if it wasn't supplied positionally or via flag
+    base_branch="${base_branch:-$(get_primary_branch)}"
+
     if [[ -z "$feature" ]]; then
-        error "Usage: aidev new <feature-name> [base-branch]"
+        error "Usage: aidev new <feature-name> [base-branch] [-b|--base <branch>]"
         exit 1
     fi
     
@@ -465,7 +505,7 @@ cmd_new() {
         warn "Worktree already exists at $worktree_path"
         if [[ "${AIDEV_NO_TMUX:-}" == "1" ]]; then
             info "Launching $AIDEV_TOOL in $worktree_path..."
-            cd "$worktree_path" && "$AIDEV_TOOL"; exec "$SHELL"
+            cd "$worktree_path" && eval "$AIDEV_TOOL"; exec "$SHELL"
         elif session_exists "$feature"; then
             info "Switching to existing session..."
             switch_to_session "$feature"
@@ -522,7 +562,7 @@ cmd_new() {
         info "Branch:   $branch_name"
         info "AI Tool:  $AIDEV_TOOL"
         info "Launching $AIDEV_TOOL..."
-        cd "$worktree_path" && "$AIDEV_TOOL"; exec "$SHELL"
+        cd "$worktree_path" && eval "$AIDEV_TOOL"; exec "$SHELL"
     elif session_exists "$feature"; then
         info "Session '$session_name' already exists, switching to it..."
         switch_to_session "$feature"
@@ -625,7 +665,7 @@ cmd_attach() {
     
     if [[ "${AIDEV_NO_TMUX:-}" == "1" ]]; then
         info "Launching $AIDEV_TOOL in $worktree_path..."
-        cd "$worktree_path" && "$AIDEV_TOOL"; exec "$SHELL"
+        cd "$worktree_path" && eval "$AIDEV_TOOL"; exec "$SHELL"
     elif session_exists "$feature"; then
         info "Switching to session '$session_name'..."
         switch_to_session "$feature"
@@ -936,6 +976,7 @@ USAGE:
 
 COMMANDS:
     new|add <feature> [base-branch]   Create new worktree, session, and launch AI tool
+                                      Base branch can also be set with -b|--base <branch>
     list|ls                           List all active feature sessions
     attach|a [feature]                Attach to an existing feature session
     status|st [feature]               Show detailed status of a feature
@@ -969,8 +1010,10 @@ EXAMPLES:
     # Start working on a new feature
     aidev new add-user-auth
 
-    # Start a feature based on a different branch
+    # Start a feature based on a different branch (positional or flag)
     aidev new hotfix-login release/v2
+    aidev new hotfix-login --base release/v2
+    aidev new hotfix-login -b release/v2
 
     # List all active features
     aidev list
